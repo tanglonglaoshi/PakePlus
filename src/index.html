@@ -1380,20 +1380,20 @@
     <div class="modal-head">关于</div>
     <div class="modal-body">
       <p><b>唐长老超级物理白板</b></p>
-      <p>面向讲台教学的轻量白板工具，所有图形来自同目录的 <b>shapes.js</b> 图形库，可自行扩展。</p>
+      <p>面向讲台教学的轻量白板工具，图形库由云端动态下发，可随时更新而无需重新分发。</p>
 
-      <p style="color:#8fa3c0;font-size:12.5px;">
-        支持多页、自由绘制、图形拖拽 / 缩放 / 旋转，以及边框、填充、线条样式的细致调节；
-        动画图形可独立或全局播放，并可导出为 PNG 图片或 WebM 视频；
-        选中多个图形后还能一键<b>组合为新图形</b>并写回 shapes.js。
-        菜单里还可进入<b>图形库管理</b>管理图形的显示与删除，以及打开<b>小程序</b>浮窗
-        （本地时间、倒计时、秒表、点名器、随机数、骰子）。
-      </p>
+<p style="color:#8fa3c0;font-size:12.5px;">
+  支持多页、自由绘制、图形拖拽 / 缩放 / 旋转，以及边框、填充、线条样式的细致调节；
+  动画图形可独立或全局播放，并可导出为 PNG 图片或 WebM 视频；
+  选中多个图形后还能一键<b>组合为新图形</b>，组合结果保存在本机，重启后仍然可用。
+  菜单里还可进入<b>图形库管理</b>管理图形的显示与删除，以及打开<b>小程序</b>浮窗
+  （本地时间、倒计时、秒表、点名器、随机数、骰子）。
+</p>
 
-      <p style="color:#8fa3c0;font-size:12.5px;">
-        内置图形分类：基础、力学、振动与波、光学、电磁、文字、简笔画、动画、近代物理等。
-        可在 shapes.js 中继续追加新的 <b>shape({...})</b> 定义，保存刷新页面即可生效。
-      </p>
+<p style="color:#8fa3c0;font-size:12.5px;">
+  内置图形分类：基础、力学、振动与波、光学、电磁、文字、简笔画、动画、近代物理等。
+  云端更新图形库后，程序启动时会提示是否升级，选择升级即可使用最新图形。
+</p>
 
       <div class="author-card">
         <div class="author-name">作者：唐龙</div>
@@ -1435,7 +1435,7 @@
 
       <p style="margin-top:12px;"><b>文字</b></p>
       <p>· 选中「文字」工具后在画布点击，会弹出文字输入框，直接输入即可；<b>双击已有文字</b>可重新编辑内容与样式。</p>
-      <p>· 文字支持字体、字号、加粗、斜体、下划线、对齐方式与颜色；这些属性也可在 shapes.js 的文字图形定义里预设默认值。</p>
+<p>· 文字支持字体、字号、加粗、斜体、下划线、对齐方式与颜色；这些属性也可在图形定义里预设默认值。</p>
       <p>· 文字也支持边框 / 填充，填充颜色和不透明度可在标签栏里调整。</p>
 
       <p style="margin-top:12px;"><b>动画</b></p>
@@ -1445,9 +1445,9 @@
       <p>· 「参数」面板里可调动画周期、振幅、角度、质量比等图形参数。</p>
 
       <p style="margin-top:12px;"><b>组合与图形库</b></p>
-      <p>· <b>组合</b>：框选或按住 <span class="kbd">Ctrl</span> / <span class="kbd">Shift</span> 多选两个以上图形后，点「组合」（或按 <span class="kbd">Ctrl</span>+<span class="kbd">G</span>）即可把它们打包成一个新图形，可命名、生成图标、选择类别，并写入 shapes.js 保存。</p>
-      <p>· 保存方式：写入 shapes.js / 生成新的 shapes.js 并下载 / 仅本次会话使用。</p>
-      <p>· <b>图形库管理</b>：菜单 →「图形库管理」（或 <span class="kbd">Ctrl</span>+<span class="kbd">L</span>）。可用类别下拉栏筛选图形，<b>只有自定义（组合）图形能被勾选删除</b>；内置 / 动画图形无法删除，但可以点右侧的<b>眼睛按钮隐藏</b>——隐藏状态会被<b>永久记住</b>（保存在浏览器本地），刷新后依然保持隐藏，再点一次即可恢复显示。</p>
+<p>· <b>组合</b>：框选或按住 <span class="kbd">Ctrl</span> / <span class="kbd">Shift</span> 多选两个以上图形后，点「组合」（或按 <span class="kbd">Ctrl</span>+<span class="kbd">G</span>）即可把它们打包成一个新图形，可命名、生成图标、选择类别。</p>
+<p>· 组合结果保存在程序目录下的 <b>custom-shapes.json</b>，关闭后重启仍然可用。</p>
+<p>· <b>图形库管理</b>：菜单 →「图形库管理」（或 <span class="kbd">Ctrl</span>+<span class="kbd">L</span>）。可用类别下拉栏筛选图形，<b>只有自定义（组合）图形能被勾选删除</b>；内置 / 动画图形无法删除，但可以点右侧的<b>眼睛按钮隐藏</b>——隐藏状态会被<b>永久记住</b>，重启后依然保持隐藏，再点一次即可恢复显示。</p>
       <p>· 画布上正在使用被删除图形的对象会一并清理，可用 <span class="kbd">Ctrl</span>+<span class="kbd">Z</span> 撤销。</p>
 
       <p style="margin-top:12px;"><b>小程序</b></p>
@@ -1468,7 +1468,7 @@
       <p style="margin-top:12px;"><b>导出</b></p>
       <p>· 菜单 →「导出图片」：可导出当前页、全部页码或指定页码范围，保存为 PNG。</p>
       <p>· 菜单 →「导出动画视频」：可把动画图形录制成 WebM 视频，支持当前页 / 全部页面、时长、帧率、清晰度设置。</p>
-      <p>· 设置里可指定导出文件夹，下次打开仍会记住；若不设置则使用浏览器默认下载位置。</p>
+<p>· 导出的图片、视频、工程文件默认保存在程序目录，可在「设置 → 导出保存位置」中调整。</p>
       <p>· 导出视频需要浏览器支持 MediaRecorder（Chrome / Edge 均可）；<b>录制耗时约等于设定时长</b>，期间请勿操作画布或切换页面。</p>
 
       <p style="margin-top:12px;"><b>设置与快捷键</b></p>
@@ -1479,7 +1479,7 @@
         <span class="kbd">Ctrl</span>+<span class="kbd">A</span> 全选 ·
         <span class="kbd">Ctrl</span>+<span class="kbd">G</span> 组合 ·
         <span class="kbd">Ctrl</span>+<span class="kbd">L</span> 图形库 ·
-        <span class="kbd">Ctrl</span>+<span class="kbd">D</span> 复制选中 ·
+<span class="kbd">Ctrl</span>+<span class="kbd">D</span> 复制选中并偏移 20px ·
         <span class="kbd">Del</span> 删除
       </p>
       <p>
@@ -1490,10 +1490,10 @@
         方向键移动选中图形
       </p>
 
-      <p style="margin-top:12px;color:#8fa3c0;font-size:12.5px;">
-        图形分类：基础、力学、振动与波、光学、电磁、文字、简笔画、动画、近代物理。<br>
-        所有图形来自同目录的 <b>shapes.js</b>，可自行扩展；保存刷新页面即生效。
-      </p>
+<p style="margin-top:12px;color:#8fa3c0;font-size:12.5px;">
+  图形分类：基础、力学、振动与波、光学、电磁、文字、简笔画、动画、近代物理。<br>
+  图形库从云端加载，作者更新后启动时会提示升级。
+</p>
 
     </div>
     <div class="modal-foot">
@@ -1620,24 +1620,15 @@
         </div>
       </div>
 
-      <div class="pblock">
-        <div class="plabel">工具栏图标</div>
-        <div class="gm-radio">
-          <label><input type="radio" name="gmIcon" value="auto" checked>
-            <span>自动缩略图<span class="sub">用组合图形本身的样子生成图标</span></span></label>
-          <label><input type="radio" name="gmIcon" value="generic">
-            <span>通用组合图标<span class="sub">所有组合图形都用统一的图标</span></span></label>
-        </div>
-      </div>
-
-      <div class="pblock">
-        <div class="plabel">保存方式</div>
-        <div class="gm-radio">
-          <label><input type="radio" name="gmMode" value="persist" checked>
-            <span>保存到本机<span class="sub">永久保存，刷新 / 重启后仍然可用</span></span></label>
-        </div>
-      </div>
-
+<div class="pblock">
+  <div class="plabel">工具栏图标</div>
+  <div class="gm-radio">
+    <label><input type="radio" name="gmIcon" value="auto" checked>
+      <span>自动缩略图<span class="sub">用组合图形本身的样子生成图标</span></span></label>
+    <label><input type="radio" name="gmIcon" value="generic">
+      <span>通用组合图标<span class="sub">所有组合图形都用统一的图标</span></span></label>
+  </div>
+</div>
       <div class="tip-line" id="gmTip"></div>
     </div>
     <div class="modal-foot">
@@ -1652,8 +1643,8 @@
     <div class="modal-head">图形库管理</div>
     <div class="modal-body">
       <div class="lib-toolbar">
-        <button class="mbtn ghost" id="libPickFile" style="height:34px;padding:0 14px;font-size:12.5px;box-shadow:none;">📂 选择 shapes.js</button>
-        <span class="lib-file" id="libFileInfo">未加载文件 · 只操作当前会话（刷新失效）</span>
+<button class="mbtn ghost" id="libPickFile" style="height:34px;padding:0 14px;font-size:12.5px;box-shadow:none;display:none;">📂 选择 shapes.js</button>
+<span class="lib-file" id="libFileInfo">图形库从云端加载</span>
       </div>
       <div class="lib-toolbar">
         <select class="lib-select" id="libCat" title="按类别筛选">
@@ -1669,11 +1660,11 @@
         <button class="mbtn ghost" id="libSelNone" style="height:32px;padding:0 12px;font-size:12.5px;box-shadow:none;">清空</button>
       </div>
       <div class="lib-list" id="libList"></div>
-      <div class="tip-line" style="margin-top:12px;">
-        · <b>自定义（组合）图形</b>：勾选后可删除，会从 shapes.js 中移除对应的 <b>shape({...})</b> 代码块。<br>
-        · <b>内置 / 动画图形</b>：不可删除，点右侧 <b>眼睛按钮</b> 可隐藏（状态会被浏览器记住，刷新后仍保持隐藏）。<br>
-        · 画布上正在使用被删除图形的对象会一并清理（可用 <span class="kbd">Ctrl</span>+<span class="kbd">Z</span> 撤销）。
-      </div>
+<div class="tip-line" style="margin-top:12px;">
+  · <b>自定义（组合）图形</b>：勾选后可删除，会从本机组合记录中移除。<br>
+  · <b>内置 / 动画图形</b>：不可删除，点右侧 <b>眼睛按钮</b> 可隐藏（状态会被记住，重启后仍保持隐藏）。<br>
+  · 画布上正在使用被删除图形的对象会一并清理（可用 <span class="kbd">Ctrl</span>+<span class="kbd">Z</span> 撤销）。
+</div>
     </div>
     <div class="modal-foot" style="justify-content:space-between;">
       <button class="mbtn ghost" id="libCancel">关闭</button>
@@ -1692,7 +1683,7 @@
     </div>
   </div>
 </div>
-<script src="shapes.js"></script>
+
 <script src="license.js"></script>
 
 <script src="app.js"></script>
