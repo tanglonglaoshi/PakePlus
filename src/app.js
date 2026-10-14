@@ -1,21 +1,12 @@
 (function () {
 'use strict';
 
-const PB = window.PhysBoard;
-if (!PB || !PB.shapes) {
-  document.body.innerHTML =
-    '<div style="max-width:540px;margin:100px auto;padding:30px 34px;' +
-    'background:linear-gradient(160deg,rgba(24,36,60,.98),rgba(14,22,40,.98));' +
-    'border:1px solid rgba(120,180,255,.25);border-radius:20px;' +
-    'box-shadow:0 30px 80px rgba(0,8,24,.7);font-size:14px;' +
-    'line-height:1.85;color:#fca5a5;font-family:system-ui,sans-serif;">' +
-    '<b style="font-size:17px;color:#fff;">未找到图形库 shapes.js</b><br><br>' +
-    '<span style="color:#b8c7de;">请确认：</span><br>' +
-    '1. <code style="background:rgba(120,180,255,.15);padding:2px 8px;border-radius:6px;">shapes.js</code> 与本 HTML 放在<b>同一文件夹</b>；<br>' +
-    '2. <code style="background:rgba(120,180,255,.15);padding:2px 8px;border-radius:6px;">&lt;script src="shapes.js"&gt;&lt;/script&gt;</code> 位于主脚本之前；<br>' +
-    '3. 浏览器控制台（F12）若无 404，说明文件名或路径有误。</div>';
-  return;
-}
+const PB = window.PhysBoard || (window.PhysBoard = {
+  shapes: {}, paramDefs: {}, categories: [],
+  register(d) { this.shapes[d.key] = d; },
+  category(id, label) { this.categories.push({ id, label }); },
+  param(key, def) { this.paramDefs[key] = def; }
+});
 
 /* =====================================================================
  * 1. 常量
@@ -447,8 +438,9 @@ const U = {
 };
 window.U_bbox = getBBox;
 
-PB.shapes['__freehand'] = {
-  key: '__freehand', cat: '__sys', geom: 'path', label: '画笔', hidden: true, icon: '',
+function installFreehandShape() {
+  PB.shapes['__freehand'] = {
+    key: '__freehand', cat: '__sys', geom: 'path', label: '画笔', hidden: true, icon: '',
   draw: function (c, o) {
     const pts = o.points;
     if (!pts || !pts.length) return;
@@ -471,6 +463,8 @@ PB.shapes['__freehand'] = {
     c.stroke();
   }
 };
+}
+
 
 /* =====================================================================
  * 5. IndexedDB
@@ -1367,6 +1361,8 @@ function buildShapePanel() {
   } else shapeGrid.appendChild(frag);
 }
 function attachCatDrag() {
+  if (catStrip._dragAttached) return;   // ← 加这一行
+  catStrip._dragAttached = true;
   let isDown = false, startX = 0, scrollStart = 0, moved = false;
   catStrip.addEventListener('mousedown', e => {
     isDown = true; startX = e.clientX; scrollStart = catStrip.scrollLeft; moved = false;
@@ -1887,62 +1883,47 @@ function toHexColor(c) {
  * ===================================================================== */
 (function () { try { idbGet('shapesJsHandle').then(h => { if (h) cachedShapesHandle = h; }); } catch (e) {} })();
 /* ===== 组合图形持久化：IndexedDB ===== */
-const CS_DB_NAME = 'physboard-custom-shapes';
-const CS_DB_STORE = 'shapes';
+/* ===== 组合图形持久化：本地 JSON 文件 ===== */
+const CS_FILE = 'custom-shapes.json';
+let __csCache = null;
 
-function csOpenDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(CS_DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(CS_DB_STORE)) {
-        db.createObjectStore(CS_DB_STORE, { keyPath: 'id' });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function csSaveRecord(rec) {
-  try {
-    const db = await csOpenDB();
-    await new Promise((res, rej) => {
-      const tx = db.transaction(CS_DB_STORE, 'readwrite');
-      tx.objectStore(CS_DB_STORE).put(rec);
-      tx.oncomplete = () => res();
-      tx.onerror = () => rej(tx.error);
-    });
-  } catch (e) {
-    console.warn('保存组合图形失败:', e);
-  }
+const __fsFallback = {
+  readFile:   async n => localStorage.getItem('__pb_' + n),
+  writeFile:  async (n, v) => localStorage.setItem('__pb_' + n, v),
+  getAppDir:  async () => ''
+};
+function csReadFS() {
+  return window.__pbFS || __fsFallback;
 }
 
 async function csLoadAll() {
+  if (__csCache) return __csCache;
+  const fs = csReadFS();
+  const text = await fs.readFile(CS_FILE);
+  if (!text) { __csCache = []; return __csCache; }
   try {
-    const db = await csOpenDB();
-    return await new Promise((res, rej) => {
-      const tx = db.transaction(CS_DB_STORE, 'readonly');
-      const req = tx.objectStore(CS_DB_STORE).getAll();
-      req.onsuccess = () => res(req.result || []);
-      req.onerror = () => rej(req.error);
-    });
+    __csCache = JSON.parse(text) || [];
   } catch (e) {
-    console.warn('加载组合图形失败:', e);
-    return [];
+    try { await fs.writeFile(CS_FILE + '.bak', text); } catch (_) {}
+    __csCache = [];
   }
+  return __csCache;
+}
+
+async function csSaveRecord(rec) {
+  const list = await csLoadAll();
+  const i = list.findIndex(r => r.id === rec.id);
+  if (i >= 0) list[i] = rec; else list.push(rec);
+  __csCache = list;
+  const fs = csReadFS();
+  await fs.writeFile(CS_FILE, JSON.stringify(list, null, 2));
 }
 
 async function csDeleteRecord(id) {
-  try {
-    const db = await csOpenDB();
-    await new Promise((res, rej) => {
-      const tx = db.transaction(CS_DB_STORE, 'readwrite');
-      tx.objectStore(CS_DB_STORE).delete(id);
-      tx.oncomplete = () => res();
-      tx.onerror = () => rej(tx.error);
-    });
-  } catch (e) {}
+  const list = await csLoadAll();
+  __csCache = list.filter(r => r.id !== id);
+  const fs = csReadFS();
+  await fs.writeFile(CS_FILE, JSON.stringify(__csCache, null, 2));
 }
 
 async function csRestoreAll() {
@@ -1959,13 +1940,10 @@ async function csRestoreAll() {
       }
     }
     PB.shapes[rec.id] = buildCustomDef({
-      id: rec.id,
-      label: rec.label,
+      id: rec.id, label: rec.label,
       cat: rec.catId || 'custom',
-      baseW: rec.baseW,
-      baseH: rec.baseH,
-      parts: rec.parts,
-      icon: rec.icon
+      baseW: rec.baseW, baseH: rec.baseH,
+      parts: rec.parts, icon: rec.icon
     });
   }
   if (hasNewCat) buildShapePanel();
@@ -2136,7 +2114,7 @@ function refreshGmIconPreview() {
   }
 }
 function updateGmTip() {
-  gmTip.innerHTML = '组合图形会保存到本机的用户数据目录中，<b>刷新和重启后仍然可用</b>。无需修改打包文件。';
+  gmTip.innerHTML = '组合图形保存在程序目录下的 <b>custom-shapes.json</b>，重启后仍然可用。';
   gmOk.textContent = '保存';
 }
 function openGroupModal() {
@@ -2166,13 +2144,7 @@ function openGroupModal() {
   try { gmPreviewRec = makeCustomRecord('preview', 'preview', 'preview', gmSelection); }
   catch (e) { gmPreviewRec = null; }
   refreshGmIconPreview();
-  const modes = document.querySelectorAll('input[name=gmMode]');
-  const preferFile = !!window.showOpenFilePicker;
-  modes.forEach(m => {
-    if (m.value === 'file') m.checked = preferFile;
-    if (m.value === 'memory') m.checked = !preferFile;
-    if (m.value === 'download') m.checked = false;
-  });
+
   updateGmTip();
   openModal('groupModal');
   setTimeout(() => { try { gmName.focus(); gmName.select(); } catch (e) {} }, 60);
@@ -2181,7 +2153,7 @@ gmCat.addEventListener('change', () => {
   gmNewCatField.style.display = gmCat.value === '__new__' ? 'block' : 'none';
   if (gmCat.value === '__new__') setTimeout(() => gmCatId.focus(), 30);
 });
-document.querySelectorAll('input[name=gmMode]').forEach(m => m.addEventListener('change', updateGmTip));
+
 document.querySelectorAll('input[name=gmIcon]').forEach(m => m.addEventListener('change', refreshGmIconPreview));
 gmCancel.addEventListener('click', () => closeModal('groupModal'));
 gmOk.addEventListener('click', async () => {
@@ -2542,7 +2514,7 @@ function openLibModal() {
     libFileInfo.textContent = '记忆文件：' + (cachedShapesHandle.name || 'shapes.js') + '（正在尝试自动加载…）';
     libFileInfo.classList.remove('loaded'); libBlocks = [];
   } else {
-    libFileInfo.textContent = '未加载文件 · 只操作当前会话（刷新失效）';
+libFileInfo.textContent = '图形库从云端加载';
     libFileInfo.classList.remove('loaded'); libBlocks = [];
   }
   renderLibList();
@@ -5982,40 +5954,167 @@ async function setupWindowControls() {
   });
 }
 
+/* 弹窗询问是否升级图形库（异步，不阻塞 UI） */
+function askUpgrade(localVer, cloudVer) {
+  return new Promise(resolve => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal show';
+    wrap.style.zIndex = '9999';
+    wrap.innerHTML =
+      '<div class="modal-card" style="max-width:420px;">' +
+        '<div class="modal-head">发现新版图形库</div>' +
+        '<div class="modal-body">' +
+          '<p style="font-size:13px;color:#b8c7de;">' +
+            '本地版本：<b>' + (localVer || '未知') + '</b><br>' +
+            '云端版本：<b>' + cloudVer + '</b>' +
+          '</p>' +
+          '<div class="tip-line">升级会覆盖本地 shapes.js，下次启动生效。</div>' +
+        '</div>' +
+        '<div class="modal-foot">' +
+          '<button class="mbtn ghost" data-ans="no">暂不升级</button>' +
+          '<button class="mbtn" data-ans="yes">立即升级</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(wrap);
+
+    let done = false;
+    function finish(v) {
+      if (done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey, true);
+      wrap.remove();
+      resolve(v);
+    }
+    function onKey(ev) {                    // ← 提到外面
+      if (ev.key !== 'Escape') return;
+      finish(false);
+    }
+
+    wrap.addEventListener('click', e => {
+      const btn = e.target.closest('[data-ans]');
+      if (!btn) return;
+      finish(btn.dataset.ans === 'yes');
+    });
+
+    document.addEventListener('keydown', onKey, true);   // ← 用外部函数
+  });
+}
+
+/* app.js 里的带超时 fetch */
+function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms || 3000);
+  return fetch(url, Object.assign({}, opts, { signal: ctrl.signal }))
+    .finally(() => clearTimeout(timer));
+}
+async function ensureShapesReady() {
+  const fs = window.__pbFS || {
+    readFile: async n => localStorage.getItem('__pb_' + n),
+    writeFile: async (n, v) => localStorage.setItem('__pb_' + n, v)
+  };
+  const API = window.__pbLicense.API_BASE;
+  const token = window.__pbLicense.getToken();
+
+  /* ① 读本地 shapes.js 和版本信息 */
+  const localCode = await fs.readFile('shapes.js');
+  const localMeta = await fs.readFile('shapes.meta.json');
+  let localVer = '';
+  try { localVer = localMeta ? (JSON.parse(localMeta).version || '') : ''; } catch (e) {}
+
+  /* ② 本地不存在 → 必须从云端下载 */
+  if (!localCode) {
+const res = await fetchWithTimeout(API + '/api/shapes', {
+  headers: { 'Authorization': 'Bearer ' + token }
+}, 15000).catch(() => null);
+if (!res || !res.ok) throw new Error('云端图形库不可用');
+    const code = await res.text();
+
+    const vRes = await fetch(API + '/api/shapes/version').catch(() => null);
+    let cloudVer = '';
+    if (vRes && vRes.ok) {
+      const vd = await vRes.json().catch(() => ({}));
+      cloudVer = vd.version || '';
+    }
+
+    await fs.writeFile('shapes.js', code);
+    await fs.writeFile('shapes.meta.json',
+      JSON.stringify({ version: cloudVer, downloadedAt: Date.now() }, null, 2));
+
+    execShapesCode(code);
+    return;
+  }
+
+  /* ③ 本地存在 → 先执行本地（保证离线可用） */
+  execShapesCode(localCode);
+
+  /* ④ 后台检查云端版本，弹窗询问是否升级 */
+  try {
+    const vRes = await fetchWithTimeout(API + '/api/shapes/version', {}, 3000).catch(() => null);
+    if (!vRes || !vRes.ok) return;
+    const vd = await vRes.json();
+    const cloudVer = vd.version || '';
+    if (!cloudVer || cloudVer === localVer) return;
+
+    const ok = await askUpgrade(localVer, cloudVer);
+    if (!ok) return;
+
+    const res = await fetchWithTimeout(API + '/api/shapes', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    }, 15000).catch(() => null);
+    if (!res || !res.ok) return;
+    const newCode = await res.text();
+    await fs.writeFile('shapes.js', newCode);
+    await fs.writeFile('shapes.meta.json',
+      JSON.stringify({ version: cloudVer, downloadedAt: Date.now() }, null, 2));
+    toast('图形库已更新，下次启动生效。', 3600);
+  } catch (e) {
+    // 离线时静默忽略
+  }
+}
+
+function execShapesCode(code) {
+  const s = document.createElement('script');
+  s.textContent = code;
+  document.head.appendChild(s);
+  if (!window.PhysBoard || !window.PhysBoard.shapes || !Object.keys(window.PhysBoard.shapes).length) {
+    throw new Error('图形库执行异常');
+  }
+}
 /* =====================================================================
  * 27. 启动
  * ===================================================================== */
 async function init() {
-  /* =================================================================
-   * ① 窗口控制（放在最前，未授权也要先挂载）
-   * ================================================================= */
+  /* ① 窗口控制 */
   await setupWindowControls();
 
-  /* =================================================================
-   * ② 授权检查（强制）
-   * ================================================================= */
+  /* ② 授权（内部处理激活 / 静默续期 / 弹窗） */
   if (!window.__pbLicense) {
     document.body.innerHTML =
-      '<div style="max-width:520px;margin:100px auto;padding:30px 34px;' +
+      '<div style="max-width:520px;margin:100px auto;padding:30px;' +
+      'color:#fca5a5;font-family:system-ui;">授权模块缺失</div>';
+    return;
+  }
+  const licensed = await window.__pbLicense.ensureActivated();
+  if (!licensed) return; // ensureActivated 内部已弹激活界面
+
+  /* ③ 加载 shapes.js（本地优先 / 云端更新提示） */
+  try {
+    await ensureShapesReady();
+  } catch (e) {
+    document.body.innerHTML =
+      '<div style="max-width:540px;margin:100px auto;padding:30px 34px;' +
       'background:linear-gradient(160deg,rgba(24,36,60,.98),rgba(14,22,40,.98));' +
       'border:1px solid rgba(120,180,255,.25);border-radius:20px;' +
-      'box-shadow:0 30px 80px rgba(0,8,24,.7);font-size:14px;' +
-      'line-height:1.85;color:#fca5a5;font-family:system-ui,sans-serif;">' +
-      '<b style="font-size:17px;color:#fff;">授权模块缺失</b><br><br>' +
-      '<span style="color:#b8c7de;">请确认 license.js 与本页面在同一目录，' +
-      '且通过 &lt;script src="license.js"&gt;&lt;/script&gt; 在 app.js 之前引入。</span></div>';
+      'color:#fca5a5;font-family:system-ui,sans-serif;line-height:1.85;">' +
+      '<b style="color:#fff;font-size:17px;">无法加载图形库</b><br><br>' +
+      '<span style="color:#b8c7de;">' + (e.message || '请检查网络连接') + '</span></div>';
     return;
   }
-  const licensed = await window.__pbLicense.check();
-  if (!licensed) {
-    window.__pbLicense.showActivationUI('请输入授权码');
-    return;
-  }
-  /* ===== 授权检查结束 ===== */
 
-  /* =================================================================
-   * ③ 白板初始化
-   * ================================================================= */
+  /* ④ 注入画笔图形定义 */
+  installFreehandShape();
+
+
   let savedBg = 'tech';
   try { savedBg = localStorage.getItem('pb_bg_id') || 'tech'; } catch (e) {}
   if (!BG_PRESETS.some(p => p.id === savedBg)) savedBg = 'tech';
@@ -6024,16 +6123,14 @@ async function init() {
   document.body.style.background = preset.css;
   if (preset.light) { state.borderColor = '#1a1a1a'; state.penColor = '#1a1a1a'; }
 
-  ensureTextShapes();
-  registerTextParams();
+ensureTextShapes();
+registerTextParams();
 
-  collectOriginalHidden();
-  applyLibHidden();
-  csRestoreAll().then(() => {
-    buildShapePanel();
-  });
-  buildPenPanel(); buildBorderPanel(); buildFillPanel(); buildBgRow(); buildShapePanel();
-  buildMiniappLauncher();
+await csRestoreAll();         // ← 先把自定义图形注入 PB.shapes
+collectOriginalHidden();      // ← 现在可以正确判断哪些 key 还存在
+applyLibHidden();
+
+buildPenPanel(); buildBorderPanel(); buildFillPanel(); buildBgRow(); buildShapePanel();
   makeTouchScrollable(shapeGrid);
   makeTouchScrollable(thumbScroll);
   makeTouchScrollable(libList);
