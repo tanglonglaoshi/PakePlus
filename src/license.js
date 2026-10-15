@@ -218,6 +218,15 @@ async function getJSON(path, token) {
 }
 
 /* ===== 5. 核心流程：确保已激活 ===== */
+/* 全局保存本次会话的授权详情 */
+let __licenseInfo = {
+  code: '',
+  expiresAt: null,       // null = 永久
+  daysLeft: null,        // null = 永久
+  maxDevices: 5,
+  boundCount: 0
+};
+
 async function ensureActivated() {
   let auth = await readAuth();
 
@@ -232,6 +241,13 @@ async function ensureActivated() {
     const r = await getJSON('/api/verify', auth.token).catch(() => null);
     if (r && r.ok) {
       __auth = auth;
+      __licenseInfo = {
+        code: r.data.code || auth.code || '',
+        expiresAt: r.data.expiresAt || null,
+        daysLeft: r.data.daysLeft != null ? r.data.daysLeft : null,
+        maxDevices: r.data.maxDevices || 5,
+        boundCount: r.data.boundCount || 0
+      };
       return true;
     }
     // token 失效 → 走续期
@@ -246,14 +262,28 @@ async function ensureActivated() {
         auth.tokenExpiresAt = Date.now() + TOKEN_DAYS * 24 * 3600 * 1000;
         await writeAuth(auth);
         __auth = auth;
+        __licenseInfo = {
+          code: r.data.code || auth.code || '',
+          expiresAt: r.data.expiresAt || null,
+          daysLeft: r.data.daysLeft != null ? r.data.daysLeft : null,
+          maxDevices: r.data.maxDevices || 5,
+          boundCount: r.data.boundCount || 0
+        };
         return true;
       }
     } catch (e) {}
   }
 
   // 都失败 → 弹激活界面
-  return await showActivationUI();
+  const activated = await showActivationUI();
+  return activated;
 }
+
+/* 供 app.js 读取授权详情 */
+function getLicenseInfo() {
+  return __licenseInfo;
+}
+
 
 function getToken()    { return __auth ? __auth.token    : ''; }
 function getDeviceId() { return __auth ? __auth.deviceId : ''; }
@@ -326,7 +356,7 @@ function showActivationUI(message) {
     mask.className = 'pblic-mask';
     mask.innerHTML = `
       <div class="pblic-card">
-        <div class="pblic-title">软件未激活</div>
+        <div class="pblic-title">软件未激活（Alt+Tab退出、Alt+F4关闭）</div>
         <div class="pblic-msg">${message || '请输入激活码完成授权。每个激活码可绑定多台设备，绑定后无需重复输入。'}</div>
         <input id="pbLicInput" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
         <div class="pblic-status" id="pbLicStatus"></div>
@@ -378,14 +408,22 @@ function showActivationUI(message) {
         auth.activatedAt = Date.now();
         await writeAuth(auth);
         __auth = auth;
-
+/* ★ 新增：保存授权详情 */
+__licenseInfo = {
+  code: r.data.code || code,
+  expiresAt: r.data.expiresAt || null,
+  daysLeft: r.data.daysLeft != null ? r.data.daysLeft : null,
+  maxDevices: r.data.maxDevices || 5,
+  boundCount: r.data.boundCount || 0
+};
         st.className = 'pblic-status ok';
-        st.textContent = '激活成功，正在进入…';
-        setTimeout(() => {
+st.textContent = '激活成功 · 本码剩余 ' +
+  ((r.data.maxDevices || 5) - (r.data.boundCount || 1)) + ' 台设备名额';
+setTimeout(() => {
           mask.remove();
           __activationPromise = null;   // 允许下次重新弹窗
           resolve(true);
-        }, 500);
+        }, 900);
       } catch (e) {
         st.className = 'pblic-status bad';
         st.textContent = '网络错误：' + (e.message || '请检查网络连接');
@@ -407,6 +445,7 @@ window.__pbLicense = {
   ensureActivated,
   getToken,
   getDeviceId,
+  getLicenseInfo,        // ★ 新增
   check: async () => !!(await readAuth()),
   showActivationUI: (msg) => showActivationUI(msg)
 };
