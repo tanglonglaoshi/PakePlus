@@ -1438,6 +1438,95 @@ function hitTest(o, pt) {
   return lp.x >= b.x1 - pad && lp.x <= b.x2 + pad &&
          lp.y >= b.y1 - pad && lp.y <= b.y2 + pad;
 }
+
+/* ---- 多边形框选（闭合曲线套索）判定 ---- */
+
+function pointInPolygon(pt, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y;
+    const xj = poly[j].x, yj = poly[j].y;
+    if (((yi > pt.y) !== (yj > pt.y)) &&
+        (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function segIntersect(a, b, c, d) {
+  function ccw(p1, p2, p3) {
+    return (p3.y - p1.y) * (p2.x - p1.x) > (p2.y - p1.y) * (p3.x - p1.x);
+  }
+  return ccw(a, c, d) !== ccw(b, c, d) && ccw(a, b, c) !== ccw(a, b, d);
+}
+
+function polygonIntersectsObject(poly, o) {
+  if (!poly || poly.length < 3) return false;
+  const def = PB.shapes[o.type];
+  const ctr = objCenter(o);
+  const rot = o.rotation || 0;
+
+  /* ---- 1. 收集图形的采样点与边 ---- */
+  const samplePts = [];
+  const edges = [];
+
+  if (o.points && o.points.length) {
+    /* 折线 / 自由绘制：按比例抽样，避免点太多拖慢 */
+    const arr = o.points;
+    const step = Math.max(1, Math.ceil(arr.length / 120));
+    for (let i = 0; i < arr.length; i += step) {
+      samplePts.push(rotatePt(arr[i], ctr, rot));
+    }
+    const lastW = rotatePt(arr[arr.length - 1], ctr, rot);
+    samplePts.push(lastW);
+    for (let i = 1; i < samplePts.length; i++) {
+      edges.push([samplePts[i - 1], samplePts[i]]);
+    }
+  } else {
+    /* 盒子类（矩形 / 线段 / 文字 / 图片 / 视频 / 自定义组合） */
+    if (isTextObj(o) && (o.tw == null || o.th == null)) {
+      try { measureText(o); } catch (e) {}
+    }
+    const b = getBBox(o);
+    const corners = [
+      { x: b.x1, y: b.y1 }, { x: b.x2, y: b.y1 },
+      { x: b.x2, y: b.y2 }, { x: b.x1, y: b.y2 }
+    ].map(p => rotatePt(p, ctr, rot));
+    samplePts.push(...corners);
+    for (let i = 0; i < 4; i++) {
+      edges.push([corners[i], corners[(i + 1) % 4]]);
+    }
+  }
+
+  /* ---- 2. 图形采样点在多边形内 → 相交 ---- */
+  for (const p of samplePts) {
+    if (pointInPolygon(p, poly)) return true;
+  }
+
+  /* ---- 3. 多边形顶点在图形 bbox 内 → 相交（盒子类） ---- */
+  const isPathLike = (o.points && o.points.length) || (def && def.geom === 'line');
+  if (!isPathLike) {
+    const obb = getWorldBBox(o);
+    for (const v of poly) {
+      if (v.x >= obb.x1 && v.x <= obb.x2 &&
+          v.y >= obb.y1 && v.y <= obb.y2) return true;
+    }
+  }
+
+  /* ---- 4. 多边形边与图形边相交 → 相交 ---- */
+  const n = poly.length;
+  for (let i = 0; i < n; i++) {
+    const a = poly[i], b = poly[(i + 1) % n];
+    for (const e of edges) {
+      if (segIntersect(a, b, e[0], e[1])) return true;
+    }
+  }
+  return false;
+}
+
+
+
 function getHandles(o) {
   const b = getBBox(o);
   const cx = (b.x1 + b.x2) / 2, cy = (b.y1 + b.y2) / 2;
@@ -1490,15 +1579,28 @@ function hitVertex(o, pt) {
 function drawSelectionOverlay() {
   const k = 1 / view.scale;
 
-  if (marquee) {
-    const m = normRect(marquee);
+  if (marquee && marquee.points && marquee.points.length >= 2) {
+    const pts = marquee.points;
     pctx.save();
     pctx.fillStyle = 'rgba(56,189,248,.10)';
     pctx.strokeStyle = 'rgba(56,189,248,.85)';
     pctx.lineWidth = 1.2 * k;
     pctx.setLineDash([5 * k, 4 * k]);
-    pctx.fillRect(m.x1, m.y1, m.w, m.h);
-    pctx.strokeRect(m.x1, m.y1, m.w, m.h);
+    pctx.lineJoin = 'round';
+    pctx.lineCap = 'round';
+    pctx.beginPath();
+    pctx.moveTo(pts[0].x, pts[0].y);
+    /* 二次贝塞尔平滑，视觉上像手绘的闭合曲线 */
+    for (let i = 1; i < pts.length - 1; i++) {
+      const mx = (pts[i].x + pts[i + 1].x) / 2;
+      const my = (pts[i].y + pts[i + 1].y) / 2;
+      pctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+    }
+    const last = pts[pts.length - 1];
+    pctx.lineTo(last.x, last.y);
+    pctx.closePath();
+    pctx.fill();
+    pctx.stroke();
     pctx.restore();
   }
   if (!selection.length) return;
@@ -5259,18 +5361,29 @@ function selectDown(pt, e) {
     return;
   }
   if (!ctrl && !shift) { selection = []; updateSelBar(); }
-  marquee = { x1:pt.x, y1:pt.y, x2:pt.x, y2:pt.y };
+  marquee = { points: [{ x: pt.x, y: pt.y }] };
   selState = { mode:'marquee', startPt:pt, additive: ctrl || shift };
   drawing = true; setCursor('crosshair');
 }
 function finalizeMarquee() {
-  if (!marquee) return;
-  const m = normRect(marquee);
-  if (m.w < 4 / view.scale && m.h < 4 / view.scale) return;
-  const picked = objects.filter(o => rectsIntersect(getWorldBBox(o), m));
+  if (!marquee || !marquee.points) return;
+  const poly = marquee.points;
+  if (poly.length < 3) return;
+
+  /* 太小就当作单击空白，不选任何东西 */
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of poly) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  if ((maxX - minX) < 4 / view.scale && (maxY - minY) < 4 / view.scale) return;
+
+  const picked = objects.filter(o => polygonIntersectsObject(poly, o));
   if (selState.additive) {
     for (const o of picked) if (selection.indexOf(o) < 0) selection.push(o);
-  } else selection = picked;
+  } else {
+    selection = picked;
+  }
 }
 function selectMove(pt, e) {
   if (!drawing || !selState) return;
@@ -5310,7 +5423,13 @@ function selectMove(pt, e) {
   }
 
   if (selState.mode === 'marquee') {
-    marquee.x2 = pt.x; marquee.y2 = pt.y;
+    if (!marquee) marquee = { points: [{ x: selState.startPt.x, y: selState.startPt.y }] };
+    const pts = marquee.points;
+    const last = pts[pts.length - 1];
+    const minDist = 2 / view.scale;   // 屏幕 2px 以内不记录，防止点爆
+    if (!last || Math.hypot(pt.x - last.x, pt.y - last.y) >= minDist) {
+      pts.push({ x: pt.x, y: pt.y });
+    }
     drawPreview(); return;
   }
   if (selState.mode === 'move') {
