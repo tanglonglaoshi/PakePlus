@@ -2030,7 +2030,268 @@
 
 <script src="license.js"></script>
 
-<script src="app.js"></script>
+<script>
+(function () {
+'use strict';
+
+/* ============================================================
+ *  主程序加载器
+ *  负责：授权检查 → 拉取 app.js → 缓存 → 版本比对 → 执行
+ * ============================================================ */
+
+const API_BASE = 'https://api.tangzhanglao123.cn';
+const APP_FILE = 'app.js';
+const VER_FILE = 'app.version';
+const BAK_FILE = 'app.js.bak';
+const SKIP_KEY = 'pb_skip_app_update';
+const TIMEOUT = 15000;
+
+/* ---------- 工具 ---------- */
+function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms || TIMEOUT);
+  return fetch(url, Object.assign({}, opts, { signal: ctrl.signal }))
+    .finally(() => clearTimeout(timer));
+}
+
+function showLoading(text) {
+  let el = document.getElementById('__pb_loader');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = '__pb_loader';
+    el.style.cssText =
+      'position:fixed;inset:0;z-index:99998;display:flex;align-items:center;' +
+      'justify-content:center;background:rgba(6,12,24,.92);backdrop-filter:blur(12px);' +
+      'font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;' +
+      'color:#8fa3c0;font-size:14px;letter-spacing:.5px;';
+    document.body.appendChild(el);
+  }
+  el.innerHTML =
+    '<div style="text-align:center;">' +
+      '<div style="width:36px;height:36px;margin:0 auto 16px;border:3px solid rgba(56,189,248,.2);' +
+      'border-top-color:#38bdf8;border-radius:50%;animation:__pbSpin .8s linear infinite;"></div>' +
+      '<div>' + (text || '正在启动…') + '</div>' +
+    '</div>';
+  if (!document.getElementById('__pbLoaderStyle')) {
+    const s = document.createElement('style');
+    s.id = '__pbLoaderStyle';
+    s.textContent = '@keyframes __pbSpin{to{transform:rotate(360deg)}}';
+    document.head.appendChild(s);
+  }
+}
+
+function hideLoading() {
+  const el = document.getElementById('__pb_loader');
+  if (el) el.remove();
+}
+
+function fatal(title, msg) {
+  hideLoading();
+  document.body.innerHTML =
+    '<div style="max-width:540px;margin:100px auto;padding:30px 34px;' +
+    'background:linear-gradient(160deg,rgba(24,36,60,.98),rgba(14,22,40,.98));' +
+    'border:1px solid rgba(120,180,255,.25);border-radius:20px;' +
+    'color:#fca5a5;font-family:system-ui,sans-serif;line-height:1.85;' +
+    'box-shadow:0 30px 80px rgba(0,8,24,.7);">' +
+    '<b style="color:#fff;font-size:17px;">' + title + '</b><br><br>' +
+    '<span style="color:#b8c7de;">' + msg + '</span></div>';
+}
+
+function askUpdate(localVer, cloudVer) {
+  return new Promise(resolve => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal show';
+    wrap.style.zIndex = '99999';
+    wrap.innerHTML =
+      '<div class="modal-card" style="max-width:440px;">' +
+        '<div class="modal-head">发现新版主程序</div>' +
+        '<div class="modal-body">' +
+          '<p style="font-size:13px;color:#b8c7de;">' +
+            '本地版本：<b>' + (localVer || '未知') + '</b><br>' +
+            '云端版本：<b>' + cloudVer + '</b>' +
+          '</p>' +
+          '<div class="tip-line">' +
+            '更新会下载新的主程序文件，<b>下次启动生效</b>。' +
+            '本次会话继续使用旧版本。' +
+          '</div>' +
+        '</div>' +
+        '<div class="modal-foot">' +
+          '<button class="mbtn ghost" data-ans="no">暂不更新</button>' +
+          '<button class="mbtn" data-ans="yes">立即更新</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(wrap);
+
+    let done = false;
+    function finish(v) {
+      if (done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey, true);
+      wrap.remove();
+      resolve(v);
+    }
+    function onKey(e) {
+      if (e.key === 'Escape') { e.stopPropagation(); finish('no'); }
+    }
+    wrap.addEventListener('click', e => {
+      const btn = e.target.closest('[data-ans]');
+      if (btn) finish(btn.dataset.ans);
+    });
+    document.addEventListener('keydown', onKey, true);
+  });
+}
+
+/* ---------- 主流程 ---------- */
+(async function boot() {
+  try {
+    showLoading('正在检查授权…');
+
+    /* ① 等 license.js 就绪 */
+    if (!window.__pbFS || !window.__pbLicense) {
+      fatal('授权模块未就绪', '请确认 license.js 与 index.html 在同一目录，并已正确引入。');
+      return;
+    }
+
+    /* ② 授权检查（内部处理激活 / 静默续期 / 弹窗） */
+    const licensed = await window.__pbLicense.ensureActivated();
+    if (!licensed) {
+      hideLoading();
+      return;
+    }
+
+    const fs = window.__pbFS;
+    const token = window.__pbLicense.getToken();
+
+    /* ③ 读本地 app.js 和版本 */
+    showLoading('正在检查主程序…');
+    let localCode = null;
+    let localVer = '';
+    try {
+      localCode = await fs.readFile(APP_FILE);
+      const verTxt = await fs.readFile(VER_FILE);
+      localVer = (verTxt || '').trim();
+    } catch (e) {}
+
+    /* ④ 拉云端版本 */
+    let cloudVer = '';
+    try {
+      const r = await fetchWithTimeout(API_BASE + '/api/app/version', {}, 5000);
+      if (r.ok) {
+        const j = await r.json();
+        cloudVer = j.version || '';
+      }
+    } catch (e) {
+      console.warn('[loader] 检查 app 版本失败：', e);
+    }
+
+    /* ⑤ 本地没有 → 必须从云端下载 */
+    if (!localCode) {
+      showLoading('首次启动，正在下载主程序…');
+      if (!cloudVer) {
+        fatal('首次启动失败', '无法从云端下载主程序，请检查网络连接后重启应用。');
+        return;
+      }
+      let r;
+      try {
+        r = await fetchWithTimeout(API_BASE + '/api/app', {
+          headers: { 'Authorization': 'Bearer ' + token }
+        }, 30000);
+      } catch (e) {
+        fatal('首次启动失败', '下载主程序超时，请检查网络连接后重启应用。');
+        return;
+      }
+      if (!r.ok) {
+        fatal('下载主程序失败', '服务器返回 ' + r.status + '，请稍后重试。');
+        return;
+      }
+      localCode = await r.text();
+      if (!localCode || localCode.length < 5000) {
+        fatal('下载内容异常', '主程序文件过短，可能是网络中断，请重启应用。');
+        return;
+      }
+      await fs.writeFile(APP_FILE, localCode);
+      await fs.writeFile(VER_FILE, cloudVer);
+      localVer = cloudVer;
+      console.log('[loader] app.js 首次下载完成，版本 ' + cloudVer);
+    }
+
+    /* ⑥ 有新版 → 询问用户是否更新 */
+    if (cloudVer && cloudVer !== localVer) {
+      let skipVer = '';
+      try { skipVer = localStorage.getItem(SKIP_KEY) || ''; } catch (e) {}
+
+      if (skipVer === cloudVer) {
+        console.log('[loader] 用户已忽略版本 ' + cloudVer);
+      } else {
+        hideLoading();
+        const ans = await askUpdate(localVer, cloudVer);
+        if (ans === 'yes') {
+          showLoading('正在下载新版主程序…');
+          try {
+            const r = await fetchWithTimeout(API_BASE + '/api/app', {
+              headers: { 'Authorization': 'Bearer ' + token }
+            }, 30000);
+            if (r.ok) {
+              const newCode = await r.text();
+              if (newCode.length > 5000 && newCode.trim().endsWith('})();')) {
+                try { await fs.writeFile(BAK_FILE, localCode); } catch (e) {}
+                await fs.writeFile(APP_FILE, newCode);
+                await fs.writeFile(VER_FILE, cloudVer);
+                console.log('[loader] 已下载新版 ' + cloudVer + '，下次启动生效');
+              } else {
+                console.warn('[loader] 新版内容异常，放弃更新');
+              }
+            }
+          } catch (e) {
+            console.warn('[loader] 更新下载失败：', e);
+          }
+        } else {
+          try { localStorage.setItem(SKIP_KEY, cloudVer); } catch (e) {}
+        }
+      }
+    }
+
+    /* ⑦ 执行 app.js */
+    showLoading('正在启动白板…');
+    try {
+      const script = document.createElement('script');
+      script.textContent = localCode;
+      document.head.appendChild(script);
+    } catch (e) {
+      console.error('[loader] app.js 执行异常：', e);
+      try {
+        const bak = await fs.readFile(BAK_FILE);
+        if (bak) {
+          await fs.writeFile(APP_FILE, bak);
+          fatal('主程序加载失败', '已回滚到上一个可用版本，请重启应用。\n\n' + e.message);
+          return;
+        }
+      } catch (e2) {}
+      fatal('主程序加载失败', e.message || '请重启应用。');
+      return;
+    }
+
+    if (!window.PhysBoard) {
+      fatal('主程序加载异常', 'PhysBoard 未初始化，可能文件损坏。请删除程序目录下的 app.js 后重启。');
+      return;
+    }
+
+    hideLoading();
+    console.log('[loader] app.js 已启动，版本 ' + localVer);
+
+  } catch (e) {
+    console.error('[loader] 启动异常', e);
+    fatal('启动失败', e.message || '发生未知错误，请重启应用。');
+  }
+})();
+
+})();
+</script>
+
+
+
+
+
 <script>
 /* ================ 悬浮球：拖动 / 隐藏工具栏 ================ */
 (function initFloatingBall() {
