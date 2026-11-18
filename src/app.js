@@ -286,6 +286,79 @@ function mixColor(a, b, t) {
   return 'rgb(' + r + ',' + g + ',' + bl + ')';
 }
 
+/* =====================================================================
+ * 1c. 文字编辑器 / 公式键盘 · 主题同步
+ *      - 顶层框架元素由 CSS 变量自动跟随 body.pb-light
+ *      - iframe（latex-formula-editor）本身是浅色的：
+ *        浅色主题 → 不注入；深色主题 → 注入深色覆盖样式
+ * ===================================================================== */
+function getEmbeddedThemeCSS() {
+  const light = document.body.classList.contains('pb-light');
+  if (light) return '';
+  return `
+    html, body {
+      background: #0a101c !important;
+      color: #e6edf7 !important;
+    }
+    body { background: #0a101c !important; }
+    input, textarea, select {
+      background: #131c2e !important;
+      color: #e6edf7 !important;
+      border-color: #2a3a55 !important;
+    }
+    input::placeholder, textarea::placeholder { color: #6b7c96 !important; }
+button:not([class*="pb-"]) {
+      background: rgba(120,180,255,.08) !important;
+      color: #e6edf7 !important;
+      border-color: rgba(120,180,255,.22) !important;
+    }
+button:not([class*="pb-"]):hover,
+    input:not([class*="pb-"]):hover,
+    textarea:not([class*="pb-"]):hover,
+    select:not([class*="pb-"]):hover {
+      background: rgba(120,180,255,.18) !important;
+    }
+
+
+    button:hover, input:hover, textarea:hover, select:hover {
+      background: rgba(120,180,255,.18) !important;
+    }
+    button.active, button[data-active="true"], .active {
+      background: rgba(56,189,248,.28) !important;
+      color: #fff !important;
+    }
+    .toolbar, .header, .footer, .panel, .card,
+    .tabs, .tab-bar, .status-bar,
+    [class*="toolbar"], [class*="header"], [class*="footer"],
+    [class*="panel"], [class*="card"] {
+      background: #0e1626 !important;
+      color: #e6edf7 !important;
+      border-color: rgba(120,180,255,.18) !important;
+    }
+    .MathJax, mjx-container { color: #e6edf7; }
+    canvas { background: #f7f3e8; }
+  `;
+}
+
+function syncEmbeddedEditorsTheme() {
+  document.querySelectorAll('iframe.pb-theme-frame').forEach(f => {
+    try {
+      const doc = f.contentDocument;
+      if (!doc || !doc.head) return;
+      let styleEl = doc.getElementById('__pb_theme_override');
+      if (!styleEl) {
+        styleEl = doc.createElement('style');
+        styleEl.id = '__pb_theme_override';
+        doc.head.appendChild(styleEl);
+      }
+      styleEl.textContent = getEmbeddedThemeCSS();
+    } catch (e) {
+      /* 跨域时忽略 */
+    }
+  });
+}
+
+
 function setupCustomBgUI() {
   /* ---- 一键换肤：在所有背景（含透明 / 自定义）之间循环 ---- */
   const randomBtn = document.getElementById('randomSkinBtn');
@@ -498,6 +571,7 @@ function isPalm(e) {
 
 function abortCurrentOp() {
   if (!drawing && !selState) return;
+  interactiveDrag = null;      // ★ 新增
   if (selState && selState.changed && !selState.snapshotDone) pushSnapshot();
   current = null;
   erasing = false;
@@ -546,6 +620,7 @@ let objects = pages[0];
 let selection = [];
 let current = null;
 let drawing = false;
+let interactiveDrag = null;   // ★ 新增：图形内交互拖拽
 let selState = null;
 let marquee = null;
 let snapshots = [];
@@ -638,93 +713,495 @@ function getFontCss(id) {
   const f = TEXT_FONTS.find(x => x.id === id);
   return f ? f.css : TEXT_FONTS[0].css;
 }
+
+/* =====================================================================
+ * 17a. 数学公式渲染（MathJax 3 → SVG → Image 缓存）
+ * ===================================================================== */
+const __mathCache   = new Map();
+const __mathSvgCache = new Map();   // ★ 新增：缓存原始 svgStr，供编辑器预览复用
+let __activeEditorPreviewRefresh = null; // ★ 新增：当前打开的编辑器预览刷新回调
+const __mathPending = new Set();
+const __mathFailed  = new Set();
+const __mathBaseFS  = 16;
+
+function isMathJaxReady() {
+  return !!(window.MathJax && typeof window.MathJax.tex2svg === 'function');
+}
+
+/* ---- 判断 LaTeX 是否“看起来完整”，避免输入过程中无效渲染 ---- */
+function isLatexLikelyComplete(latex) {
+  const s = String(latex || '');
+  if (!s.trim()) return false;
+  
+  /* 大括号不配对 → 不完整 */
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '{') depth++;
+    else if (s[i] === '}') { depth--; if (depth < 0) return false; }
+  }
+  if (depth !== 0) return false;
+  
+  /* 以 \ 结尾（转义还没写完） → 不完整 */
+  if (s.endsWith('\\')) return false;
+  
+  /* ★ 删除了 /\\[a-zA-Z]+$/ 的正则，允许 \Phi, \alpha, \sin 等直接渲染 */
+  
+  return true;
+}
+
+function parseMathSegments(line) {
+  const segments = [];
+  let i = 0;
+  while (i < line.length) {
+    const idxDollar = line.indexOf('$', i);
+    const idxInline = line.indexOf('\\(', i);
+    if (idxDollar < 0 && idxInline < 0) {
+      if (i < line.length) segments.push({ type: 'text', value: line.slice(i) });
+      break;
+    }
+    let useDollar = (idxDollar >= 0) && (idxInline < 0 || idxDollar <= idxInline);
+    if (useDollar) {
+      const isDisplay = line[idxDollar + 1] === '$';
+      const delimLen  = isDisplay ? 2 : 1;
+      const end = isDisplay
+        ? line.indexOf('$$', idxDollar + 2)
+        : line.indexOf('$', idxDollar + 1);
+      if (end < 0) { segments.push({ type: 'text', value: line.slice(i) }); break; }
+      if (idxDollar > i) segments.push({ type: 'text', value: line.slice(i, idxDollar) });
+      segments.push({ type: 'math', latex: line.slice(idxDollar + delimLen, end), display: isDisplay });
+      i = end + delimLen;
+    } else {
+      const end = line.indexOf('\\)', idxInline + 2);
+      if (end < 0) { segments.push({ type: 'text', value: line.slice(i) }); break; }
+      if (idxInline > i) segments.push({ type: 'text', value: line.slice(i, idxInline) });
+      segments.push({ type: 'math', latex: line.slice(idxInline + 2, end), display: false });
+      i = end + 2;
+    }
+  }
+  return segments;
+}
+
+function parseTextWithMath(text) {
+  return String(text || '').split('\n').map(parseMathSegments);
+}
+
+/* ---- 把 MathJax 输出正确转成可被 Image 加载的 SVG 字符串 ---- */
+function mathJaxToSvgString(container, color) {
+  if (!container) throw new Error('MathJax 返回为空');
+
+  let svgNode = null;
+  if (container.tagName && container.tagName.toLowerCase() === 'svg') {
+    svgNode = container;
+  } else if (container.querySelector) {
+    svgNode = container.querySelector('svg');
+  }
+  if (!svgNode) throw new Error('未找到 <svg> 节点');
+
+  let svgStr = svgNode.outerHTML;
+
+  /* ★ 新增：在删除 style 前，先提取 vertical-align 里的 descent */
+  let descentEx = 0;
+  const styleM = svgStr.match(/style="([^"]*)"/i);
+  if (styleM) {
+    const vm = styleM[1].match(/vertical-align:\s*(-?[\d.]+)ex/i);
+    if (vm) descentEx = -parseFloat(vm[1]);   // MathJax 常写 -X ex（负值代表下沉）
+  }
+
+  try {
+    const globalDefs = document.querySelector('#MJX-SVG-global-cache defs');
+    if (globalDefs && svgStr.includes('<use')) {
+      svgStr = svgStr.replace(/(<svg[^>]*>)/, `$1${globalDefs.outerHTML}`);
+    }
+  } catch (e) {}
+
+  svgStr = svgStr.replace(/currentColor/g, color || '#e6edf7');
+
+  const vbMatch = svgStr.match(/viewBox="([^"]+)"/);
+  let pxW = 100, pxH = 30;
+  if (vbMatch) {
+    const parts = vbMatch[1].trim().split(/[\s,]+/).map(Number);
+    const vbW = parts[2], vbH = parts[3];
+    if (vbW > 0 && vbH > 0) {
+      pxW = Math.max(1, Math.round(vbW / 1000 * __mathBaseFS));
+      pxH = Math.max(1, Math.round(vbH / 1000 * __mathBaseFS));
+    }
+  }
+  svgStr = svgStr
+    .replace(/(<svg[^>]*?)\sstyle="[^"]*"/i, '$1')
+    .replace(/(<svg[^>]*?)\swidth="[^"]*"/i, '$1')
+    .replace(/(<svg[^>]*?)\sheight="[^"]*"/i, '$1')
+    .replace(/<svg/i, `<svg width="${pxW}" height="${pxH}"`);
+
+  if (!/xmlns=/i.test(svgStr)) {
+    svgStr = svgStr.replace(/<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+  }
+
+  return { svgStr, pxW, pxH, descentEx };     // ← 多返回一个 descentEx
+}
+
+
+function getMathImage(latex, display, color) {
+  const key = (display ? 'D:' : 'I:') + latex + '|' + (color || '');
+  const cached = __mathCache.get(key);
+  if (cached) return cached;
+  if (__mathFailed.has(key) || __mathPending.has(key)) return null;
+
+  if (!isLatexLikelyComplete(latex)) return null;
+
+  if (!isMathJaxReady()) {
+    if (!__mathPending.has('__boot__')) {
+      __mathPending.add('__boot__');
+      const waitReady = (window.MathJax.startup && window.MathJax.startup.promise)
+        ? window.MathJax.startup.promise : Promise.resolve();
+      waitReady.then(() => {
+        __mathPending.delete('__boot__');
+        try { render(); drawPreview(); updateSelBarPosition(); } catch (e) {}
+      }).catch(() => { __mathPending.delete('__boot__'); });
+    }
+    return null;
+  }
+
+  __mathPending.add(key);
+  (async () => {
+    try {
+      const node = window.MathJax.tex2svg(latex, { display: !!display });
+
+      /* ★ 修复：原来只解构 svgStr，导致下面的 descentEx 未定义 → ReferenceError */
+      const { svgStr, pxW, pxH, descentEx } = mathJaxToSvgString(node, color);
+
+      const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+      const url  = URL.createObjectURL(blob);
+
+      const img = await new Promise((res, rej) => {
+        const im = new Image();
+        im.onload = () => {
+          im._descentEx = descentEx;
+          res(im);
+        };
+        im.onerror = () => rej(new Error('SVG → Image 失败'));
+        im.src = url;
+      });
+
+      URL.revokeObjectURL(url);
+      __mathCache.set(key, img);
+      /* ★ 新增：存一份原始 SVG，供编辑器预览复用 */
+      __mathSvgCache.set(key, { svgStr, pxW, pxH, descentEx });
+
+      __mathVersion++;
+      scheduleRender();
+
+      /* ★ 新增：通知当前打开的文字编辑器刷新预览 */
+      if (typeof __activeEditorPreviewRefresh === 'function') {
+        try { __activeEditorPreviewRefresh(); } catch (e) {}
+      }
+
+      try { render(); drawPreview(); updateSelBarPosition(); } catch (e) {}
+    } catch (e) {
+      console.warn('[math] 渲染失败：', latex, e);
+      __mathFailed.add(key);
+      if (typeof __activeEditorPreviewRefresh === 'function') {
+        try { __activeEditorPreviewRefresh(); } catch (_) {}
+      }
+      try { render(); drawPreview(); } catch (_) {}
+    } finally {
+      __mathPending.delete(key);
+    }
+  })();
+
+  return null;
+}
+
+
+
+
 function textFontString(o) {
   const fs = Math.max(6, o.fontSize || 32);
   const fam = getFontCss(o.fontFamily);
   return (o.italic ? 'italic ' : '') + (o.bold ? '700 ' : '400 ') + fs + 'px ' + fam;
 }
+
 function measureText(o) {
+  const fs    = Math.max(6, o.fontSize || 32);
+  const raw   = (o.text == null) ? '' : String(o.text);
+  const color = o.color || '#e6edf7';
+
+  const parsedLines = parseTextWithMath(raw);
+
   ctx.save();
   ctx.font = textFontString(o);
-  const lines = String(o.text == null ? '' : o.text).split('\n');
-  let w = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const mw = ctx.measureText(lines[i]).width;
-    if (mw > w) w = mw;
+
+  /* ---- 兜底字形度量（用于空文本 / 字体不支持 actualBoundingBox 时） ---- */
+  const FALLBACK_ASCENT  = fs * 0.82;
+  const FALLBACK_DESCENT = fs * 0.22;
+  /* ---- 行间额外留白：上下各分一半，既不贴身也不撑开 ---- */
+  const LEADING = fs * 0.12;
+
+  let maxW = 0, totalH = 0;
+  let hasMath = false;
+  const lineData = [];
+
+  for (const segments of parsedLines) {
+    let w = 0;
+    const lineSegs = [];
+
+    /* 本行内所有段相对 alphabetic baseline 的 ascent / descent 最大值 */
+    let lineAscent  = 0;
+    let lineDescent = 0;
+    let hasContent  = false;
+
+    for (const seg of segments) {
+      /* ---------- 普通文字 ---------- */
+      if (seg.type === 'text') {
+        const text = seg.value || '';
+        const m = ctx.measureText(text);
+        const tw = m.width;
+
+        /* actualBoundingBox* 在空字符串或部分旧浏览器上返回 0 / undefined */
+        let asc = m.actualBoundingBoxAscent;
+        let des = m.actualBoundingBoxDescent;
+        if (!isFinite(asc) || asc <= 0) asc = FALLBACK_ASCENT;
+        if (!isFinite(des) || des <= 0) des = FALLBACK_DESCENT;
+
+        const hasGlyph = /\S/.test(text);
+        if (hasGlyph) {
+          hasContent = true;
+          if (asc > lineAscent)  lineAscent  = asc;
+          if (des > lineDescent) lineDescent = des;
+        }
+
+        lineSegs.push({
+          type: 'text',
+          value: text,
+          width: tw,
+          ascent: asc,
+          descent: des,
+          hasGlyph
+        });
+        w += tw;
+        continue;
+      }
+
+      /* ---------- 公式段 ---------- */
+      hasMath = true;
+      const scale = fs / 16;
+      const img   = getMathImage(seg.latex, seg.display, color);
+
+      if (img && img.naturalWidth) {
+        /* 已就绪：把图片按基线拆成 ascent / descent */
+        const iw = img.naturalWidth  * scale;
+        const ih = img.naturalHeight * scale;
+        const descent =
+          (typeof img._descentEx === 'number' && isFinite(img._descentEx))
+            ? Math.max(0, img._descentEx * fs / 2)
+            : ih * 0.22;
+        const ascent = Math.max(0, ih - descent);
+
+        lineSegs.push({
+          type: 'math',
+          img,
+          width:   iw,
+          height:  ih,
+          ascent:  ascent,
+          descent: descent
+        });
+        w += iw;
+        hasContent = true;
+        if (ascent  > lineAscent)  lineAscent  = ascent;
+        if (descent > lineDescent) lineDescent = descent;
+      }
+      else {
+        /* 未就绪占位符：保持原有估算逻辑，居中放置，不参与基线对齐 */
+        const estW = Math.max(fs, seg.latex.length * fs * 0.55);
+        const isIncomplete = !isLatexLikelyComplete(seg.latex);
+        const pendingKey   = (seg.display ? 'D:' : 'I:') + seg.latex + '|' + color;
+        const isFailed     = !isIncomplete && __mathFailed.has(pendingKey);
+
+        lineSegs.push({
+          type: 'math',
+          width:      estW,
+          height:     fs * 1.3,
+          pending:    !isIncomplete && !isFailed,
+          failed:     isFailed,
+          incomplete: isIncomplete
+          /* 无 ascent/descent → draw 时走"盒内居中"分支 */
+        });
+        w += estW;
+        hasContent = true;
+        /* 占位符用兜底行高参与布局，避免行高塌陷 */
+        if (FALLBACK_ASCENT  > lineAscent)  lineAscent  = FALLBACK_ASCENT;
+        if (FALLBACK_DESCENT > lineDescent) lineDescent = FALLBACK_DESCENT;
+      }
+    }
+
+    /* ---- 本行最终高度 ---- */
+    let lineHeight;
+    if (hasContent) {
+      lineHeight = lineAscent + lineDescent + LEADING;
+      /* 把 LEADING 均分到上下，保证基线两侧对称，bbox 中心 = 视觉中心 */
+      lineAscent  += LEADING / 2;
+      lineDescent += LEADING / 2;
+    } else {
+      /* 空行：如 "a\n\nb" 里的中间行，给一个合理的默认高度 */
+      lineAscent  = FALLBACK_ASCENT  + LEADING / 2;
+      lineDescent = FALLBACK_DESCENT + LEADING / 2;
+      lineHeight  = lineAscent + lineDescent;
+    }
+
+    lineData.push({
+      segments:    lineSegs,
+      width:       w,
+      height:      lineHeight,
+      ascent:      lineAscent,
+      descent:     lineDescent
+    });
+    if (w > maxW) maxW = w;
+    totalH += lineHeight;
   }
-  o.tw = w;
-  o.th = Math.max(1, lines.length) * (o.fontSize || 32) * 1.3;
+
+  o.tw            = maxW;
+  o.th            = Math.max(1, totalH);
+  o._lineData     = lineData;
+  o._lineDataFs   = fs;
+  o._lineDataColor= color;
+  o._hasMath      = hasMath;
+
   ctx.restore();
 }
+
 function drawTextShape(c, o) {
-  const fs = Math.max(6, o.fontSize || 32);
-  const raw = (o.text == null) ? '' : String(o.text);
-  const lines = raw.split('\n');
-  const lh = fs * 1.3;
+  const fs    = Math.max(6, o.fontSize || 32);
   const align = o.textAlign || 'left';
+  const color = o.color || '#e6edf7';
+
+  /* ------------------------------------------------------------------
+   * 1. 缓存失效判断（与旧版一致）
+   * ------------------------------------------------------------------ */
+  const needRemeasure =
+    !o._lineData ||
+    o._lineDataFs !== fs ||
+    o._lineDataColor !== color ||
+    (o._hasMath && o._mathVersion !== __mathVersion);
+
+  if (needRemeasure) {
+    measureText(o);
+    o._mathVersion = __mathVersion;
+  }
+
+  const lineData = o._lineData || [];
+  const maxW     = o.tw || 0;
 
   c.save();
   c.setLineDash([]);
-  c.lineCap = 'round';
-  c.lineJoin = 'round';
-  c.font = textFontString(o);
-  c.textBaseline = 'top';
-  c.textAlign = (align === 'center' || align === 'right') ? align : 'left';
+  c.lineCap   = 'round';
+  c.lineJoin  = 'round';
+  c.font      = textFontString(o);
+  c.textBaseline = 'alphabetic';   /* ← 关键改动：改用 alphabetic baseline */
+  c.textAlign    = 'left';
+  c.fillStyle    = color;
+  c.strokeStyle  = color;
 
-  let maxW = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const w = c.measureText(lines[i]).width;
-    if (w > maxW) maxW = w;
-  }
-  const totalH = lines.length * lh;
-
+  /* ------------------------------------------------------------------
+   * 2. 背景填充（逻辑不变，o.th 现在已是紧包围盒高度）
+   * ------------------------------------------------------------------ */
   if (o.fill && o.fillColor) {
-    const padX = fs * 0.2;
-    const padY = fs * 0.1;
+    const padX = fs * 0.2, padY = fs * 0.1;
     const a = (o.fillAlpha != null ? o.fillAlpha : 0.6);
     c.save();
     c.globalAlpha = Math.max(0, Math.min(1, a));
     c.fillStyle = o.fillColor;
     const bx = o.x - padX, by = o.y - padY;
-    const bw = maxW + padX * 2, bh = totalH + padY * 2;
+    const bw = maxW + padX * 2, bh = o.th + padY * 2;
     const rx = Math.min(8, fs * 0.15);
     if (c.roundRect) {
-      c.beginPath();
-      c.roundRect(bx, by, bw, bh, rx);
-      c.fill();
+      c.beginPath(); c.roundRect(bx, by, bw, bh, rx); c.fill();
     } else {
       c.fillRect(bx, by, bw, bh);
     }
     c.restore();
+    c.fillStyle = color;
   }
 
-  const col = o.color || '#e6edf7';
-  c.fillStyle = col;
-  c.strokeStyle = col;
+  /* ------------------------------------------------------------------
+   * 3. 逐行绘制
+   *    - 文本 / 公式：都以 alphabetic baseline 对齐
+   *    - 占位符：走盒内居中分支
+   * ------------------------------------------------------------------ */
+  let topY = o.y;
+  for (const lineInfo of lineData) {
+    /* 本行基线 = 行顶 + 本行 ascent */
+    const baselineY = topY + lineInfo.ascent;
 
-  let ax = o.x;
-  if (align === 'center') ax = o.x + maxW / 2;
-  else if (align === 'right') ax = o.x + maxW;
+    /* 按对齐方式算本行起点 x */
+    let x = o.x;
+    if (align === 'center')      x = o.x + (maxW - lineInfo.width) / 2;
+    else if (align === 'right')  x = o.x + (maxW - lineInfo.width);
 
-  for (let i = 0; i < lines.length; i++) {
-    const y = o.y + i * lh;
-    c.fillText(lines[i], ax, y);
-    if (o.underline && lines[i]) {
-      const w = c.measureText(lines[i]).width;
-      let sx = ax;
-      if (align === 'center') sx = ax - w / 2;
-      else if (align === 'right') sx = ax - w;
-      const uy = y + fs * 1.14;
-      c.lineWidth = Math.max(1, fs / 16);
-      c.beginPath();
-      c.moveTo(sx, uy);
-      c.lineTo(sx + w, uy);
-      c.stroke();
+    for (const seg of lineInfo.segments) {
+      if (seg.type === 'text') {
+        /* ---------- 3.1 普通文字 ---------- */
+        if (seg.hasGlyph) {
+          c.fillText(seg.value, x, baselineY);
+
+          if (o.underline) {
+            /* 下划线：基线下方 descent + 一点点视觉余量 */
+            const des = (typeof seg.descent === 'number' && isFinite(seg.descent))
+                        ? seg.descent : fs * 0.22;
+            const uy = baselineY + des + fs * 0.06;
+            c.lineWidth = Math.max(1, fs / 16);
+            c.beginPath();
+            c.moveTo(x, uy);
+            c.lineTo(x + seg.width, uy);
+            c.stroke();
+          }
+        }
+        /* 纯空白段（如行首空格）：不绘制也不画下划线，宽度已在布局中占位 */
+      }
+      else if (seg.img) {
+        /* ---------- 3.2 公式图片（按基线对齐） ----------
+         * 基线 = 图片底边 - descent  →  dy = baselineY - (height - descent) */
+        let dy;
+        if (typeof seg.descent === 'number' && isFinite(seg.descent)) {
+          dy = baselineY - (seg.height - seg.descent);
+        } else {
+          /* 兜底：盒内垂直居中 */
+          dy = topY + (lineInfo.height - seg.height) / 2;
+        }
+        c.drawImage(seg.img, x, dy, seg.width, seg.height);
+      }
+      else {
+        /* ---------- 3.3 公式占位符 ---------- */
+        const boxFont = '400 ' + (fs * 0.7) + 'px ui-monospace,Menlo,Consolas,monospace';
+        c.save();
+        c.font = boxFont;
+        c.textBaseline = 'alphabetic';
+
+        /* 让占位符文字大致在盒内垂直居中：
+         * baseline 位置 ≈ 盒顶 + 盒高/2 + 字高×0.35 */
+        const boxBaseline = topY + lineInfo.height / 2 + fs * 0.7 * 0.35;
+
+        if (seg.incomplete) {
+          c.fillStyle = 'rgba(143,163,192,.5)';    // 灰色：还没输完
+          c.fillText('…', x, boxBaseline);
+        } else if (seg.failed) {
+          c.fillStyle = 'rgba(248,113,113,.75)';   // 红色：渲染报错
+          c.fillText('[公式错误]', x, boxBaseline);
+        } else {
+          c.fillStyle = 'rgba(125,211,252,.75)';   // 蓝色：异步中
+          c.fillText('[…]', x, boxBaseline);
+        }
+        c.restore();
+        c.font = textFontString(o);                // 恢复主字体
+        c.textBaseline = 'alphabetic';
+      }
+
+      x += seg.width;
     }
+
+    topY += lineInfo.height;
   }
+
   c.restore();
 }
-
 function getBBox(o) {
   let x1,y1,x2,y2;
   if (o.points && o.points.length) {
@@ -778,6 +1255,7 @@ function objCenter(o) {
 function copyObj(o) {
   const t = Object.assign({}, o);
   if (o.points) t.points = o.points.map(p => ({x:p.x, y:p.y}));
+  if (o._view) t._view = Object.assign({}, o._view);   // ★ 新增
   return t;
 }
 function cloneGeo(o) {
@@ -845,7 +1323,8 @@ const U = {
   bbox: getBBox,
   arrowHead: arrowHead,
   rad: d => d*Math.PI/180,
-  _cur: null
+  _cur: null,
+  _scale: 1          // ★ 新增
 };
 window.U_bbox = getBBox;
 
@@ -1233,7 +1712,10 @@ function drawObjectRaw(c, o) {
   c.strokeStyle = (o.hasBorder === false) ? 'rgba(0,0,0,0)' : (o.color || '#e6edf7');
   c.fillStyle = o.color || '#e6edf7';   
   const prev = U._cur;
-  U._cur = o;
+U._cur = o;
+U._scale = view.scale;           // ★ 新增
+o._viewScale = view.scale;       // ★ 新增（供 onPan 使用）
+
   const prevT = animState.t, prevP = animState.playing, prevS = animState.speed;
   if (def.animatable) {
     ensureAnimFields(o);
@@ -1916,6 +2398,20 @@ function deletePage(idx) {
  * 14. Toast
  * ===================================================================== */
 let toastTimer = null;
+let __mathVersion = 0;      // 每次公式异步渲染成功 +1
+let __renderScheduled = false;
+function scheduleRender() {
+  if (__renderScheduled) return;
+  __renderScheduled = true;
+  requestAnimationFrame(() => {
+    __renderScheduled = false;
+    render();
+    drawPreview();
+    if (selBar.classList.contains('show')) updateSelBarPosition();
+  });
+}
+
+
 function toast(msg, ms) {
   let el = document.getElementById('__toast');
   if (!el) {
@@ -2190,6 +2686,114 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+
+
+/* =====================================================================
+ * A1. 追加到 selBar 的「存函数」按钮（仅选中 funcPlotter 时显示）
+ * ===================================================================== */
+(function ensureFuncSaveBtn() {
+  function install() {
+    const selBar = document.getElementById('selBar');
+    if (!selBar) { setTimeout(install, 80); return; }
+    if (document.getElementById('tagFuncSave')) return;
+    const btn = document.createElement('button');
+    btn.className = 'sbtn';
+    btn.id = 'tagFuncSave';
+    btn.title = '拖动此按钮到已打开的抽屉上，即可把当前函数保存进抽屉';
+    btn.style.display = 'none';
+    btn.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>' +
+      '</svg><span>存函数</span>';
+    const delBtn = document.getElementById('tagDelete');
+    if (delBtn) selBar.insertBefore(btn, delBtn);
+    else selBar.appendChild(btn);
+
+    /* 拖动保存逻辑 */
+    btn.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0) return;
+      const one = selection[0];
+      if (!one || one.type !== 'funcPlotter') return;
+      const code = String(one['智能指令'] || '');
+      if (!code.trim()) { toast('该函数图形还没有绘制脚本'); return; }
+
+      const defaultLabel = code.split('\n')[0].slice(0, 18);
+      const label = prompt('给这条函数起个名字（保存到抽屉后显示）：', defaultLabel);
+      if (label === null) return;
+      const finalLabel = (label || defaultLabel).trim() || defaultLabel;
+
+      e.preventDefault();
+      const ghost = document.createElement('div');
+      ghost.textContent = '📌 ' + finalLabel;
+      ghost.style.cssText =
+        'position:fixed; z-index:99999; pointer-events:none; ' +
+        'padding:8px 14px; background:linear-gradient(135deg,#22d3ee,#a855f7); ' +
+        'color:#fff; border-radius:10px; font-size:12px; font-weight:600; ' +
+        'box-shadow:0 8px 24px rgba(34,211,238,.65),0 0 0 1px rgba(255,255,255,.25) inset; ' +
+        'transform:translate(-50%,-50%);';
+      ghost.style.left = e.clientX + 'px';
+      ghost.style.top = e.clientY + 'px';
+      document.body.appendChild(ghost);
+
+      let dropGroupId = null;
+
+      const move = function (ev) {
+        ghost.style.left = ev.clientX + 'px';
+        ghost.style.top = ev.clientY + 'px';
+        document.querySelectorAll('.pb-ex-drawer [data-group-id]').forEach(function (n) {
+          n.style.outline = '';
+          n.style.background = '';
+          n.style.outlineOffset = '';
+        });
+        const hovered = document.elementFromPoint(ev.clientX, ev.clientY);
+        const groupEl = hovered && hovered.closest && hovered.closest('.pb-ex-drawer [data-group-id]');
+        if (groupEl) {
+          groupEl.style.outline = '2px dashed #22d3ee';
+          groupEl.style.outlineOffset = '3px';
+          groupEl.style.background = 'rgba(34,211,238,.12)';
+          dropGroupId = groupEl.dataset.groupId;
+        } else {
+          dropGroupId = null;
+        }
+      };
+
+      const up = function (ev) {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        ghost.remove();
+        document.querySelectorAll('.pb-ex-drawer [data-group-id]').forEach(function (n) {
+          n.style.outline = '';
+          n.style.background = '';
+          n.style.outlineOffset = '';
+        });
+
+        if (dropGroupId && window.__pbFuncPlotter) {
+          window.__pbFuncPlotter.addItem(dropGroupId, finalLabel, code);
+          if (window.__exDrawerElRefresh) window.__exDrawerElRefresh();
+          toast('✅ 已保存到抽屉：' + finalLabel);
+        } else {
+          toast('拖到已打开的抽屉上才能保存');
+        }
+      };
+
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+    });
+  }
+  install();
+})();
+
+
+
+
+
+
+
+
+
+
+
+
 /* =====================================================================
  * 17. 选中标签栏
  * ===================================================================== */
@@ -2208,6 +2812,8 @@ function updateSelBar() {
   const hasParams = !!(def && def.params && def.params.length);
   const isImage = !!(one && one.type === '__image');
   const isVideo = !!(one && one.type === '__video');
+  const isFuncPlotter = !!(one && one.type === 'funcPlotter');
+
   const tagAnim = document.getElementById('tagAnim');
   const tagResetAnim = document.getElementById('tagResetAnim');
   const tagParams = document.getElementById('tagParams');
@@ -2216,6 +2822,8 @@ function updateSelBar() {
   const tagAnimText = document.getElementById('tagAnimText');
   const tagEnhance = document.getElementById('tagEnhance');
   const tagVideo = document.getElementById('tagVideo');
+  const tagFuncSaveEl = document.getElementById('tagFuncSave');
+  if (tagFuncSaveEl) tagFuncSaveEl.style.display = isFuncPlotter ? '' : 'none';
   tagAnim.style.display = isAnim ? '' : 'none';
   tagResetAnim.style.display = isAnim ? '' : 'none';
   tagParams.style.display = hasParams ? '' : 'none';
@@ -2293,29 +2901,73 @@ function updateSelBarPosition() {
 function positionSubPanel(el) {
   requestAnimationFrame(() => {
     const barRect = selBar.getBoundingClientRect();
-    const w = el.offsetWidth || 300;
+    const bb = selection.length === 1 ? getWorldBBox(selection[0]) : unionBBox(selection);
+    const sp1 = worldToScreen(bb.x1, bb.y1);
+    const sp2 = worldToScreen(bb.x2, bb.y2);
+
+    const midY = (sp1.y + sp2.y) / 2;
+    const w = el.offsetWidth  || 300;
     const h = el.offsetHeight || 200;
-    let left = barRect.left + barRect.width / 2 - w / 2;
-    let top = barRect.bottom + 10;
-    if (top + h > window.innerHeight - 12) {
-      const above = barRect.top - h - 10;
-      if (above > 12) top = above;
-      else top = Math.max(12, window.innerHeight - h - 12);
+    const gap = 12, M = 8;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const cxBar = barRect.left + barRect.width / 2;
+
+    /* ★ 1) 图形右侧 */
+    let left = sp2.x + gap;
+    let top  = midY - h / 2;
+    if (left + w <= vw - M) {
+      top = Math.max(M, Math.min(vh - h - M, top));
+      el.style.left = left + 'px';
+      el.style.top  = top  + 'px';
+      return;
     }
-    if (left < 12) left = 12;
-    if (left + w > window.innerWidth - 12) left = window.innerWidth - w - 12;
-    if (top < 12) top = 12;
+
+    /* ★ 2) 图形左侧 */
+    left = sp1.x - w - gap;
+    if (left >= M) {
+      top = Math.max(M, Math.min(vh - h - M, midY - h / 2));
+      el.style.left = left + 'px';
+      el.style.top  = top  + 'px';
+      return;
+    }
+
+    /* 3) 按钮下方 */
+    left = Math.max(M, Math.min(vw - w - M, cxBar - w / 2));
+    top  = barRect.bottom + gap;
+    if (top + h <= vh - M) {
+      el.style.left = left + 'px';
+      el.style.top  = top  + 'px';
+      return;
+    }
+
+    /* 4) 按钮上方 */
+    top = barRect.top - h - gap;
+    if (top >= M) {
+      el.style.left = left + 'px';
+      el.style.top  = top  + 'px';
+      return;
+    }
+
+    /* 5) 兜底：按钮下方强制放置 */
+    left = Math.max(M, Math.min(vw - w - M, cxBar - w / 2));
+    top  = Math.max(M, Math.min(vh - h - M, barRect.bottom + gap));
     el.style.left = left + 'px';
-    el.style.top = top + 'px';
+    el.style.top  = top  + 'px';
   });
 }
+
 function hideSubPanels() {
   borderPanel.classList.remove('show');
   fillPanel.classList.remove('show');
   paramsPanel.classList.remove('show');
   enhancePanel.classList.remove('show');
   videoEditPanel.classList.remove('show');
+  /* 关闭参数面板时清掉示例抽屉 */
+  if (typeof __destroyExDrawer === 'function') __destroyExDrawer();
 }
+
+
 document.getElementById('tagAnim').addEventListener('click', () => {
   const one = selection[0];
   if (!one || !isAnimObj(one)) return;
@@ -2432,6 +3084,8 @@ let textEditTarget = null;
 let textEditIsNew = false;
 let textEditOriginalText = '';
 let committingText = false;
+let textEditorAnchor = null;   // ← 新增：记录编辑器锚定屏幕坐标
+let textMathPanelEl = null;  
 
 function startNewText(pt) {
   const type = state.tool;
@@ -2483,19 +3137,39 @@ function startNewText(pt) {
   openTextEditor(o, true);
 }
 
-
 function openTextEditor(o, isNew) {
   if (textEditorEl) commitTextEditor();
   if (!o) return;
   textEditTarget = o;
   textEditIsNew = !!isNew;
   textEditOriginalText = o.text || '';
+  textEditorAnchor = null;
 
   const el = document.createElement('div');
-  el.className = 'text-editor';
+  const ball = document.getElementById('__pb_ball');
+  if (ball) ball.style.display = 'none';
+  el.className = 'text-editor-fullscreen';
+  
+  // 构建全屏编辑器 UI
   el.innerHTML =
-    '<textarea class="te-input" spellcheck="false" placeholder="输入文字…（Ctrl+Enter 完成，Esc 取消）"></textarea>' +
-    '<div class="te-bar">' +
+    '<div class="te-fs-header">' +
+      '<div class="te-fs-title">编辑文字</div>' +
+      '<div class="te-fs-actions">' +
+        '<button class="te-fs-btn te-fs-ok" data-b="ok" title="保存 (Ctrl+Enter)">✓ 保存</button>' +
+        '<button class="te-fs-btn te-fs-cancel" data-b="cancel" title="取消 (Esc)">✕ 关闭</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="te-fs-body">' +
+      '<div class="te-fs-left">' +
+        '<textarea class="te-input te-fs-textarea" spellcheck="false" ' +
+          'placeholder="输入文字…&#10;&#10;公式语法：&#10;· 行内公式：$x^2 + y^2 = 1$&#10;· 独立公式：$$\\frac{a}{b}$$&#10;· 也支持 \\( ... \\) 和 \\[ ... \\]&#10;&#10;按 Alt+M 或点击 ∑ 打开公式编辑器"></textarea>' +
+      '</div>' +
+      '<div class="te-fs-right">' +
+        '<div class="te-fs-preview-head">预览</div>' +
+        '<div class="te-fs-preview" data-el="preview"></div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="te-fs-toolbar">' +
       '<select class="te-font" title="字体"></select>' +
       '<input type="number" class="te-size" min="6" max="400" step="1" title="字号">' +
       '<button class="te-btn" data-b="bold" title="加粗">B</button>' +
@@ -2507,13 +3181,234 @@ function openTextEditor(o, isNew) {
       '<button class="te-btn" data-a="right" title="右对齐">⇥</button>' +
       '<span class="te-sep"></span>' +
       '<input type="color" class="te-color" title="颜色">' +
-      '<button class="te-btn te-ok" data-b="ok" title="完成">✓</button>' +
-      '<button class="te-btn te-cancel" data-b="cancel" title="取消">✕</button>' +
-    '</div>';
+      '<span class="te-sep"></span>' +
+      '<button class="te-btn te-math-toggle" title="公式编辑器 (Alt+M)" style="font-family:serif;font-weight:bold;">∑</button>' +
+    '</div>' +
+'<div class="te-fs-math-panel" data-el="mathPanel">' +
+  '<div class="te-math-insert-area"></div>' +
+'</div>';
+    
   document.body.appendChild(el);
   textEditorEl = el;
 
-  const fontSel = el.querySelector('.te-font');
+  /* ---- 关键引用 ---- */
+  const fontSel   = el.querySelector('.te-font');
+  const ta        = el.querySelector('.te-input');
+/* ========== 选中公式 → 拖到公式面板 (Pointer 伪拖拽) ========== */
+let formulaDragGhost = null;
+
+function getSelectedFormula() {
+  const start = ta.selectionStart, end = ta.selectionEnd;
+  if (start === end) return null;
+  const text = ta.value.slice(start, end).trim();
+  return text || null;
+}
+function cleanFormulaText(t) {
+  t = t.trim();
+  if (t.startsWith('$$') && t.endsWith('$$')) return t.slice(2, -2).trim();
+  if (t.startsWith('$') && t.endsWith('$')) return t.slice(1, -1).trim();
+  return t;
+}
+function hideFormulaDragGhost() {
+  if (formulaDragGhost) formulaDragGhost.style.display = 'none';
+}
+function showFormulaDragGhost() {
+  const t = getSelectedFormula();
+  if (!t) { hideFormulaDragGhost(); return; }
+  const g = ensureFormulaDragGhost();
+  const rect = ta.getBoundingClientRect();
+  g.style.display = 'block';
+  g.style.right = '26px';
+  g.style.top = (rect.top + 10) + 'px';
+  g.style.left = 'auto'; 
+}
+
+function ensureFormulaDragGhost() {
+  if (formulaDragGhost) return formulaDragGhost;
+  const g = document.createElement('div');
+  g.className = 'te-formula-ghost';
+  g.textContent = '📌 拖到公式面板';
+  g.title = '按住拖动到右侧公式面板的抽屉 / 常用区';
+  document.body.appendChild(g);
+
+  // ★ 关键：彻底禁用原生拖拽，改用 Pointer 事件模拟
+  g.draggable = false; 
+  
+  let dragging = false;
+  let dragPayload = '';
+
+  g.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    const t = getSelectedFormula();
+    if (!t) return;
+    
+    e.preventDefault();
+    dragPayload = cleanFormulaText(t);
+    dragging = true;
+    g.setPointerCapture(e.pointerId);
+    g.classList.add('dragging');
+    g.style.cursor = 'grabbing';
+    
+    // 自动打开公式面板，方便用户继续拖入
+    const mathToggle = el.querySelector('.te-math-toggle');
+    const mathPanel  = el.querySelector('[data-el=mathPanel]');
+    if (mathToggle && mathPanel && !mathPanel.classList.contains('show')) {
+      mathToggle.click();
+    }
+
+    // ★ 新增：通知 iframe 拖拽开始
+    const frame = document.getElementById('latexEditorFrame');
+    if (frame && frame.contentWindow) {
+        frame.contentWindow.postMessage({ type: 'pb:drag-start' }, '*');
+    }
+  });
+
+
+  g.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    g.style.left = (e.clientX + 15) + 'px';
+    g.style.top  = (e.clientY + 15) + 'px';
+    g.style.right = 'auto';
+    
+    // 把坐标发给 iframe，让它自己判断高亮
+    const frame = document.getElementById('latexEditorFrame');
+    if (frame && frame.contentWindow) {
+        const r = frame.getBoundingClientRect();
+        const ix = e.clientX - r.left;
+        const iy = e.clientY - r.top;
+        frame.contentWindow.postMessage({
+            type: 'pb:drag-move',
+            x: ix,
+            y: iy,
+            inFrame: e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom
+        }, '*');
+    }
+  });
+
+  g.addEventListener('pointerup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    g.releasePointerCapture(e.pointerId);
+    g.classList.remove('dragging');
+    g.style.cursor = 'grab';
+    g.style.left = ''; g.style.top = ''; g.style.right = '26px'; g.style.display = 'none';
+
+    const frame = document.getElementById('latexEditorFrame');
+    if (!frame || !frame.contentWindow || !dragPayload) return;
+
+    const r = frame.getBoundingClientRect();
+    const ix = e.clientX - r.left;
+    const iy = e.clientY - r.top;
+    const inFrame = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+
+    // 通知 iframe 拖拽结束并投放
+    frame.contentWindow.postMessage({
+        type: 'pb:drag-end',
+        x: ix,
+        y: iy,
+        inFrame: inFrame,
+        latex: dragPayload
+    }, '*');
+
+    g.textContent = '✓ 已添加';
+    setTimeout(() => { g.textContent = '📌 拖到公式面板'; }, 1500);
+  });
+
+  g.addEventListener('pointercancel', () => {
+    dragging = false;
+    g.classList.remove('dragging');
+    g.style.left = ''; g.style.top = ''; g.style.right = '26px';
+    const frame = document.getElementById('latexEditorFrame');
+    if (frame && frame.contentWindow) {
+        frame.contentWindow.postMessage({ type: 'pb:drag-end', inFrame: false }, '*');
+    }
+  });
+  formulaDragGhost = g;
+  return g;
+}
+
+/* 通过鼠标屏幕坐标判断是否在 iframe 内部的抽屉 / 常用区上 */
+function findFrameDropTarget(sx, sy) {
+  const frame = document.getElementById('latexEditorFrame');
+  if (!frame) return null;
+  const r = frame.getBoundingClientRect();
+  if (sx < r.left || sx > r.right || sy < r.top || sy > r.bottom) return null;
+
+  try {
+    const doc = frame.contentDocument;
+    if (!doc) return null;
+    
+    // 鼠标相对于 iframe 视口的坐标
+    const ix = sx - r.left;
+    const iy = sy - r.top;
+    
+    // 1. 遍历所有的抽屉，判断坐标是否在抽屉的矩形范围内（无视浮窗遮挡）
+    const wraps = doc.querySelectorAll('.pb-group-wrap');
+    for (let i = 0; i < wraps.length; i++) {
+        const wRect = wraps[i].getBoundingClientRect();
+        // 允许稍微扩大一点判断范围（向外扩大 5px），方便用户对准
+        if (ix >= wRect.left - 5 && ix <= wRect.right + 5 && iy >= wRect.top - 5 && iy <= wRect.bottom + 5) {
+            return { type: 'group', gid: wraps[i].dataset.groupId, el: wraps[i] };
+        }
+    }
+    
+    // 2. 检查是否在“常用”区域内部
+    const common = doc.getElementById('commonButtons');
+    if (common) {
+        const cRect = common.getBoundingClientRect();
+        if (ix >= cRect.left - 5 && ix <= cRect.right + 5 && iy >= cRect.top - 5 && iy <= cRect.bottom + 5) {
+            return { type: 'common', el: common };
+        }
+    }
+  } catch (err) { /* 跨域忽略 */ }
+  return null;
+}
+
+function highlightFrameTarget(drop) {
+  clearFrameHighlight();
+  if (!drop || !drop.el) return;
+  
+  // 用更显眼的青色发光虚线标记
+  drop.el.style.outline = '3px dashed #22d3ee';
+  drop.el.style.outlineOffset = '6px';
+  drop.el.style.background = 'rgba(34,211,238,.25)';
+  drop.el.style.boxShadow = '0 0 20px rgba(34,211,238,.8)';
+  drop.el.style.transition = 'all .2s';
+  drop.el.style.borderRadius = '8px';
+}
+
+function clearFrameHighlight() {
+  const frame = document.getElementById('latexEditorFrame');
+  if (!frame) return;
+  try {
+    const doc = frame.contentDocument;
+    if (!doc) return;
+    doc.querySelectorAll('.pb-group-wrap, #commonButtons').forEach(el => {
+      el.style.outline = '';
+      el.style.outlineOffset = '';
+      el.style.background = '';
+      el.style.boxShadow = '';
+    });
+  } catch (err) {}
+}
+/* 监听选区变化 */
+['mouseup', 'keyup', 'select'].forEach(ev => {
+  ta.addEventListener(ev, () => setTimeout(showFormulaDragGhost, 10));
+});
+ta.addEventListener('mousedown', () => {
+  setTimeout(() => { if (!getSelectedFormula()) hideFormulaDragGhost(); }, 10);
+});
+/* ======================================================== */
+
+
+  const previewEl = el.querySelector('[data-el=preview]');
+  const sizeInp   = el.querySelector('.te-size');
+  const colorInp  = el.querySelector('.te-color');
+  const mathPanel = el.querySelector('[data-el=mathPanel]');
+  const mathToggle= el.querySelector('.te-math-toggle');
+  textMathPanelEl = mathPanel;
+
+  // 初始化字体下拉框
   TEXT_FONTS.forEach(f => {
     const op = document.createElement('option');
     op.value = f.id; op.textContent = f.label;
@@ -2522,10 +3417,6 @@ function openTextEditor(o, isNew) {
   });
   fontSel.value = o.fontFamily || 'system';
 
-  const ta = el.querySelector('.te-input');
-  const sizeInp = el.querySelector('.te-size');
-  const colorInp = el.querySelector('.te-color');
-
   ta.value = o.text || '';
   sizeInp.value = o.fontSize || 32;
   colorInp.value = toHexColor(o.color || '#e6edf7');
@@ -2533,87 +3424,251 @@ function openTextEditor(o, isNew) {
   function syncBtns() {
     el.querySelectorAll('[data-b]').forEach(b => {
       const k = b.dataset.b;
-      if (k === 'bold') b.classList.toggle('on', !!o.bold);
-      if (k === 'italic') b.classList.toggle('on', !!o.italic);
+      if (k === 'bold')      b.classList.toggle('on', !!o.bold);
+      if (k === 'italic')    b.classList.toggle('on', !!o.italic);
       if (k === 'underline') b.classList.toggle('on', !!o.underline);
     });
     el.querySelectorAll('[data-a]').forEach(b => {
       b.classList.toggle('on', (o.textAlign || 'left') === b.dataset.a);
     });
   }
-  syncBtns();
+
+  /* ---- 预览 ---- */
+  function svgStrToDataUrl(s) {
+    const bytes = new TextEncoder().encode(s);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return 'data:image/svg+xml;base64,' + btoa(bin);
+  }
+
+  function renderPreview() {
+    if (!previewEl || !ta) return;
+    clearTimeout(previewEl._timer);
+    const raw = String(o.text == null ? '' : o.text);
+    if (!raw.trim()) { previewEl.innerHTML = ''; return; }
+
+    const fs        = o.fontSize || 32;
+    const color     = o.color || '#e6edf7';
+    const previewFs = Math.min(22, Math.max(13, fs * 0.65));
+    const fontCss   = getFontCss(o.fontFamily).replace(/"/g, "'");
+    const mathScale = previewFs / 16;
+
+    const parsedLines = parseTextWithMath(raw);
+    let html = '';
+    let hasPending = false;
+
+    parsedLines.forEach((segments, lineIdx) => {
+      if (lineIdx > 0) html += '<br>';
+      if (!segments.length) return;
+      for (const seg of segments) {
+        if (seg.type === 'text') {
+          const txt = escapeHtmlSelf(seg.value).replace(/ /g, '&nbsp;');
+          html += '<span style="font-family:' + fontCss + ';font-size:' + previewFs +
+                  'px;color:' + color + ';line-height:1.5;">' + txt + '</span>';
+          continue;
+        }
+        const key = (seg.display ? 'D:' : 'I:') + seg.latex + '|' + color;
+        const rec = __mathSvgCache.get(key);
+        if (rec && rec.svgStr) {
+          const url = svgStrToDataUrl(rec.svgStr);
+          const iw  = Math.max(1, Math.round(rec.pxW * mathScale));
+          const ih  = Math.max(1, Math.round(rec.pxH * mathScale));
+          html += '<img src="' + url + '" style="width:' + iw + 'px;height:' + ih +
+                  'px;vertical-align:middle;margin:0 2px;">';
+        } else if (__mathFailed.has(key)) {
+          html += '<span style="color:#f87171;font-size:11px;padding:0 4px;">[公式错误]</span>';
+        } else {
+          hasPending = true;
+          getMathImage(seg.latex, seg.display, color);
+          html += '<span style="display:inline-block;padding:0 6px;background:rgba(56,189,248,.15);color:#7dd3fc;border-radius:4px;font-size:11px;line-height:1.6;">∑…</span>';
+        }
+      }
+    });
+
+    previewEl.innerHTML = html;
+    if (hasPending) {
+      previewEl._timer = setTimeout(() => {
+        if (textEditorEl && textEditorEl.querySelector('[data-el=preview]') === previewEl) {
+          renderPreview();
+        }
+      }, 100);
+    }
+  }
 
   function refresh() {
     measureText(o);
-    render();
-    positionTextEditor();
+    scheduleRender();
+    renderPreview();
   }
 
-  ta.addEventListener('input', () => {
+  syncBtns();
+
+  /* =====================================================================
+   * 集成 moskensoap/latex-formula-editor (iframe 通信方案)
+   *   点击 iframe 内的公式按钮 → 立即插入到当前 textarea
+   * ===================================================================== */
+  const mathCont  = mathPanel.querySelector('.te-math-insert-area');
+ 
+
+  // 1. 创建 iframe
+  const editorFrame = document.createElement('iframe');
+  editorFrame.id = 'latexEditorFrame';
+  editorFrame.className = 'pb-theme-frame';
+  editorFrame.src = 'latex-formula-editor/index.html';
+  editorFrame.style.cssText = 'width: 100%; height: 100%; border: none;';
+  editorFrame.addEventListener('load', () => {
+    try {
+      const doc = editorFrame.contentDocument;
+      if (doc && !doc.head && doc.documentElement) {
+        const head = doc.createElement('head');
+        doc.documentElement.insertBefore(head, doc.documentElement.firstChild);
+      }
+    } catch (e) {}
+    syncEmbeddedEditorsTheme();
+  });
+  mathCont.appendChild(editorFrame);
+
+  // 2. 直接插入公式（由 iframe 点击触发）
+  function insertFormulaLatex(latex) {
+    if (!latex || !latex.trim()) return;
+    const start  = ta.selectionStart, end = ta.selectionEnd;
+    const before = ta.value.slice(0, start);
+    const after  = ta.value.slice(end);
+    const hasOpen = (before.match(/\$/g) || []).length % 2 === 1;
+    const payload = hasOpen ? latex : '$' + latex + '$';
+
+    ta.value = before + payload + after;
+    const newPos = start + payload.length;
+    ta.setSelectionRange(newPos, newPos);
+
     o.text = ta.value;
     refresh();
-  });
-  ta.addEventListener('keydown', e => {
-    if (e.key === 'Escape') { e.preventDefault(); cancelTextEditor(); }
-    else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); commitTextEditor(); }
+
+    // 插入后保持 focus，方便连续点击插入多个公式
+    requestAnimationFrame(() => { try { ta.focus(); } catch (e) {} });
+  }
+
+  // 3. 监听 iframe 发来的 insert-formula 消息
+  const messageHandler = (event) => {
+    if (event.source !== editorFrame.contentWindow) return;
+    const d = event.data;
+    if (!d || typeof d !== 'object') return;
+    if (d.type === 'insert-formula' && typeof d.latex === 'string') {
+      insertFormulaLatex(d.latex);
+    }
+  };
+  window.addEventListener('message', messageHandler);
+
+  // 4. 面板控制
+  function openMathPanel() {
+    mathPanel.classList.add('show');
+    mathToggle.classList.add('on');
+  }
+  function closeMathPanel() {
+    mathPanel.classList.remove('show');
+    mathToggle.classList.remove('on');
+    window.removeEventListener('message', messageHandler);
+    requestAnimationFrame(() => { if (ta) ta.focus(); });
+  }
+
+  mathToggle.addEventListener('click', () => {
+    if (mathPanel.classList.contains('show')) closeMathPanel();
+    else openMathPanel();
   });
 
-  fontSel.addEventListener('change', () => {
-    o.fontFamily = fontSel.value;
-    refresh();
+
+  // 输入框和快捷键
+  ta.addEventListener('keydown', e => {
+    if (e.altKey && (e.key === 'm' || e.key === 'M')) {
+      e.preventDefault(); openMathPanel(); return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      if (mathPanel.classList.contains('show')) closeMathPanel();
+      else cancelTextEditor();
+      return;
+    }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault(); commitTextEditor();
+    }
   });
+
+  ta.addEventListener('input', () => { o.text = ta.value; refresh(); });
+  fontSel.addEventListener('change', () => { o.fontFamily = fontSel.value; refresh(); });
   sizeInp.addEventListener('input', () => {
     o.fontSize = Math.max(6, Math.min(400, parseInt(sizeInp.value, 10) || 32));
     refresh();
   });
-  colorInp.addEventListener('input', () => {
-    o.color = colorInp.value;
-    refresh();
-  });
+  colorInp.addEventListener('input', () => { o.color = colorInp.value; refresh(); });
 
   el.addEventListener('click', e => {
     const btn = e.target.closest('button');
     if (!btn) return;
     const b = btn.dataset.b, a = btn.dataset.a;
-    if (b === 'ok') { commitTextEditor(); return; }
+    if (b === 'ok')     { commitTextEditor(); return; }
     if (b === 'cancel') { cancelTextEditor(); return; }
-    if (b === 'bold') { o.bold = !o.bold; }
-    if (b === 'italic') { o.italic = !o.italic; }
-    if (b === 'underline') { o.underline = !o.underline; }
-    if (a) { o.textAlign = a; }
+    if (b === 'bold')      o.bold = !o.bold;
+    if (b === 'italic')    o.italic = !o.italic;
+    if (b === 'underline') o.underline = !o.underline;
+    if (a) o.textAlign = a;
     syncBtns();
     refresh();
     ta.focus();
   });
 
-  positionTextEditor();
-  requestAnimationFrame(() => { try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch (e) {} });
+  /* ---- 首屏 ---- */
+  __activeEditorPreviewRefresh = renderPreview;
+  renderPreview();
+
+  requestAnimationFrame(() => {
+    try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch (e) {}
+  });
 }
 
-function positionTextEditor() {
+
+
+
+function positionTextEditor(force) {
   if (!textEditorEl || !textEditTarget) return;
-  const o = textEditTarget;
-  const bb = getWorldBBox(o);
-  const sp1 = worldToScreen(bb.x1, bb.y1);
-  const sp2 = worldToScreen(bb.x2, bb.y2);
 
-  const w = textEditorEl.offsetWidth || 420;
-  const h = textEditorEl.offsetHeight || 160;
-  let left = sp1.x;
-  let top = sp2.y + 12;
-  if (top + h > window.innerHeight - 12) {
-    const above = sp1.y - h - 12;
-    top = above > 12 ? above : Math.max(12, window.innerHeight - h - 12);
+  /* ★ 全屏编辑器不需要计算浮动位置，直接返回 */
+  if (textEditorEl.classList.contains('text-editor-fullscreen')) return;
+
+  // 关键：只有首次打开，或视图发生变化时才重新计算位置；
+  // 编辑过程中的 resize / 输入 / 回车 一律不动，避免文字框跟着跳
+  if (!textEditorAnchor || force) {
+    const o = textEditTarget;
+    const bb = getWorldBBox(o);
+    const sp1 = worldToScreen(bb.x1, bb.y1);
+    const sp2 = worldToScreen(bb.x2, bb.y2);
+
+    const w = textEditorEl.offsetWidth || 430;
+    const h = textEditorEl.offsetHeight || 160;
+    let left = sp1.x;
+    let top = sp2.y + 12;
+    if (top + h > window.innerHeight - 12) {
+      const above = sp1.y - h - 12;
+      top = above > 12 ? above : Math.max(12, window.innerHeight - h - 12);
+    }
+    if (left + w > window.innerWidth - 12) left = window.innerWidth - w - 12;
+    if (left < 12) left = 12;
+    if (top < 12) top = 12;
+    textEditorAnchor = { left, top };
   }
-  if (left + w > window.innerWidth - 12) left = window.innerWidth - w - 12;
-  if (left < 12) left = 12;
-  textEditorEl.style.left = left + 'px';
-  textEditorEl.style.top = top + 'px';
+
+  textEditorEl.style.left = textEditorAnchor.left + 'px';
+  textEditorEl.style.top  = textEditorAnchor.top  + 'px';
 }
+
 
 function commitTextEditor() {
+document.querySelectorAll('.te-formula-ghost').forEach(n => n.remove());
+const ball = document.getElementById('__pb_ball');
+if (ball) ball.style.display = 'grid';
   if (committingText) return;
   committingText = true;
+__activeEditorPreviewRefresh = null;
   try {
     const el = textEditorEl;
     const o = textEditTarget;
@@ -2622,8 +3677,10 @@ function commitTextEditor() {
     textEditTarget = null;
     textEditIsNew = false;
     if (!el) return;
-    el.remove();
 
+
+    el.remove();
+textEditorAnchor = null;
     if (!o) { setTool('select'); return; }
 
     const txt = String(o.text == null ? '' : o.text).replace(/\s+$/, '');
@@ -2660,6 +3717,10 @@ function commitTextEditor() {
 }
 
 function cancelTextEditor() {
+document.querySelectorAll('.te-formula-ghost').forEach(n => n.remove());
+const ball = document.getElementById('__pb_ball');
+if (ball) ball.style.display = 'grid';
+__activeEditorPreviewRefresh = null;
   const el = textEditorEl;
   const o = textEditTarget;
   const isNew = textEditIsNew;
@@ -2667,8 +3728,10 @@ function cancelTextEditor() {
   textEditorEl = null;
   textEditTarget = null;
   textEditIsNew = false;
-  if (el) el.remove();
 
+
+  if (el) el.remove();
+textEditorAnchor = null;
   if (!o) { setTool('select'); return; }
 
   if (isNew) {
@@ -3895,6 +4958,35 @@ const __SELF_DEEPSEEK_PROMPT = `我在用 PhysBoard 电子白板（一个基于 
   - 动画图形可以在 draw 里通过 (window.PhysBoard.animState.t) 拿到全局动画时间（秒）
   - 如果声明 animatable: true，选中图形会出现"播放/暂停"按钮
 
+【param 定义格式 —— 第二个参数必须是对象，不能传数字！】
+正确写法：
+param('初速度', { label: '初速度', min: 0, max: 1000, step: 10, def: 150 });
+param('质量比', { label: '质量比', min: 0.05, max: 50, step: 0.05, def: 1 });
+param('阻尼',   { label: '阻尼',   min: 0, max: 5,    step: 0.1, def: 0 });
+param('显示轨迹', { label: '显示轨迹', min: 0, max: 1,  step: 1,   def: 1 });
+param('振幅',   { label: '振幅',   min: 4, max: 200,  step: 1,   def: 30, unit: 'px' });
+
+对象字段说明：
+- label   必填，参数显示名
+- min/max/step  滑杆范围（range 类型必填）
+- def     必填，默认值
+- unit    可选，单位后缀，如 '°'、's'、'kg'、'px'
+- type    可选，'select'（下拉）/ 'toggle'（开关）/ 默认 range（滑杆）
+
+读取时用 o[key] 直接访问，例如：
+const v0 = o['初速度'] ?? 150;
+const damp = o['阻尼'] ?? 0;
+
+❌ 错误写法（参数面板会显示 undefined，千万不要这样写）：
+param('初速度', 150);
+param('质量比', 1);
+
+【icon 字段】
+只放 24×24 视角下的 SVG 子元素（<path>、<rect>、<circle>、<line>、<polygon> 等），
+不要外面再套一层 <svg>...</svg>，框架会自动包。
+❌ 错误：icon: '<svg xmlns="..." viewBox="0 0 24 24"><path .../></svg>'
+✅ 正确：icon: '<circle cx="12" cy="12" r="8"/><path d="M8 12l3 3 5-6"/>'
+
 【我要画的图形】
 这里写你想要的图形描述，例如：
 - 一条波浪线，可以调节波浪高度和周期数
@@ -3902,13 +4994,26 @@ const __SELF_DEEPSEEK_PROMPT = `我在用 PhysBoard 电子白板（一个基于 
 - 一个三棱镜色散光谱图
 - 一个弹簧振子，可以播放动画
 
+【参考示例：一个完整的动画图形】
+下面是「磁聚焦模型」的完整代码。它演示了：
+  · param 用对象格式定义参数
+  · shape({...}) 声明 animatable: true
+  · draw 里读取 window.PhysBoard.animState.t 计算每帧状态
+  · 用 U.bbox(o) 拿包围盒，U.alpha(color, a) 拿带透明度的颜色
+它比较长，仅供你参考结构，你生成的代码应当比这更精简。
+
+\`\`\`js
+${__SELF_MAGFOCUS_CODE.trim()}
+\`\`\`
+
 【输出要求】
 - 只输出 JavaScript 代码，不要解释
-- 代码必须包含 param(...) 定义可调参数和 shape({...}) 定义图形
+- 必须包含 param(...)（对象格式，不能传数字）和 shape({...})
+- icon 字段用 24x24 视角的 SVG 子元素，不要外包围 <svg>
+- 如果涉及动画：声明 animatable: true，并在 draw 里读取 window.PhysBoard.animState.t，不要用 setInterval / requestAnimationFrame
 - 中文注释保持简洁
-- icon 字段用 24x24 视角的 SVG path
-- 如果涉及动画，使用 requestAnimationFrame 或 animState.t，不要用 setInterval
 `;
+
 
 /* ---- 文件读写 ---- */
 async function readSelfShapesFile() {
@@ -4209,6 +5314,8 @@ function openSelfShapesModal() {
   });
 })();
 
+
+
 /* =====================================================================
  * 18. 样式面板
  * ===================================================================== */
@@ -4405,6 +5512,852 @@ function syncFillUI() {
   const a = Math.round((one.fillAlpha != null ? one.fillAlpha : state.fillAlpha) * 100);
   fillAlphaInput.value = a; fillAlphaVal.textContent = a + '%';
 }
+
+
+
+
+/* =====================================================================
+ * 参数面板 · 文本框示例抽屉（v2 · 支持自定义抽屉 + 长按菜单 + 管理）
+ * ===================================================================== */
+let __exDrawerEl = null;
+let __exDrawerAnchor = null;
+let __exDrawerMenuEl = null;
+let __exDrawerManagerEl = null;
+
+function __closeExDrawerMenu() {
+  if (__exDrawerMenuEl) { __exDrawerMenuEl.remove(); __exDrawerMenuEl = null; }
+}
+function __closeExDrawerManager() {
+  if (__exDrawerManagerEl) { __exDrawerManagerEl.remove(); __exDrawerManagerEl = null; }
+}
+function __destroyExDrawer() {
+  if (__exDrawerEl) { __exDrawerEl.remove(); __exDrawerEl = null; }
+  __exDrawerAnchor = null;
+  __closeExDrawerMenu();
+  document.removeEventListener('pointerdown', __exDrawerOutsideHandler, true);
+  window.removeEventListener('scroll', __positionExDrawer, true);
+  window.removeEventListener('resize', __positionExDrawer);
+}
+
+/* 统一从 window.__pbFuncPlotter 拿组数据；没有 API 时退回 pd.exampleGroups */
+function __normalizeExampleGroups(pd) {
+  const api = window.__pbFuncPlotter;
+  if (api && typeof api.getGroups === 'function') {
+    try {
+      const groups = api.getGroups();
+      if (Array.isArray(groups) && groups.length) {
+        return groups.map(g => ({
+          id: g.id, name: g.name, builtin: !!g.builtin,
+          items: (g.items || []).map(it => ({
+            id: it.id, label: it.label || (it.code || '').split('\n')[0].slice(0, 18),
+            code: String(it.code || '')
+          })).filter(it => it.code)
+        })).filter(g => g.items.length || !g.builtin);
+      }
+    } catch (e) { console.warn('[funcDrawer] getGroups 失败：', e); }
+  }
+  if (Array.isArray(pd.exampleGroups) && pd.exampleGroups.length) {
+    return pd.exampleGroups.map((g, gi) => ({
+      id: 'legacy_' + gi, name: g.name || '未命名', builtin: false,
+      items: (g.items || []).map((it, ii) => ({
+        id: 'li_' + gi + '_' + ii,
+        label: it.label || (it.code || '').split('\n')[0].slice(0, 18),
+        code: String(it.code || '')
+      })).filter(it => it.code)
+    })).filter(g => g.items.length);
+  }
+  return [];
+}
+
+function __appendToTextarea(input, code) {
+  const cur = input.value;
+  const needNl = cur.length > 0 && !/\n$/.test(cur);
+  input.value = cur + (needNl ? '\n' : '') + code;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  try {
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    input.scrollTop = input.scrollHeight;
+  } catch (e) {}
+}
+
+function __positionExDrawer() {
+  if (!__exDrawerEl || !__exDrawerAnchor) return;
+  const inp = __exDrawerAnchor.input;
+  if (!inp || !inp.isConnected) { __destroyExDrawer(); return; }
+
+  const rect = inp.getBoundingClientRect();
+  const W = __exDrawerEl.offsetWidth;
+  const H = __exDrawerEl.offsetHeight;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const gap = 10, M = 8;
+  const midX = rect.left + rect.width / 2;
+
+  let left;
+  if (midX < vw / 2) {
+    left = rect.left - W - gap;
+    if (left < M) left = rect.right + gap;
+  } else {
+    left = rect.right + gap;
+    if (left + W > vw - M) left = rect.left - W - gap;
+  }
+  left = Math.max(M, Math.min(vw - W - M, left));
+
+  let top = rect.top;
+  if (top + H > vh - M) top = Math.max(M, vh - H - M);
+  if (top < M) top = M;
+
+  __exDrawerEl.style.left = left + 'px';
+  __exDrawerEl.style.top = top + 'px';
+}
+
+/* 通用悬浮菜单 */
+function __showFloatingMenu(anchorEl, items) {
+  __closeExDrawerMenu();
+  if (!items || !items.length) return;
+  const menu = document.createElement('div');
+  menu.style.cssText =
+    'position:fixed; z-index:9999; min-width:150px; ' +
+    'background:rgba(16,26,44,.98); ' +
+    'border:1px solid rgba(120,180,255,.32); ' +
+    'border-radius:10px; padding:4px; ' +
+    'box-shadow:0 12px 32px rgba(0,8,24,.65);';
+  items.forEach(it => {
+    if (it.sep) {
+      const sp = document.createElement('div');
+      sp.style.cssText = 'height:1px;margin:3px 6px;background:rgba(120,180,255,.15);';
+      menu.appendChild(sp);
+      return;
+    }
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = it.label;
+    b.style.cssText =
+      'display:block; width:100%; text-align:left; padding:7px 12px; ' +
+      'border:none; background:transparent; color:#c8d5ea; ' +
+      'font-family:inherit; font-size:12.5px; border-radius:7px; cursor:pointer;';
+    b.addEventListener('mouseenter', () => { b.style.background = 'rgba(56,189,248,.18)'; b.style.color = '#7dd3fc'; });
+    b.addEventListener('mouseleave', () => { b.style.background = 'transparent'; b.style.color = '#c8d5ea'; });
+    b.addEventListener('click', (e) => { e.stopPropagation(); __closeExDrawerMenu(); if (it.onClick) it.onClick(); });
+    menu.appendChild(b);
+  });
+  document.body.appendChild(menu);
+  const r = anchorEl.getBoundingClientRect();
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  let left = r.left, top = r.bottom + 4;
+  if (left + mw > vw - 8) left = vw - mw - 8;
+  if (top + mh > vh - 8) top = r.top - mh - 4;
+  if (left < 8) left = 8;
+  if (top < 8) top = 8;
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+  __exDrawerMenuEl = menu;
+}
+
+/* 长按检测：pointerdown 起 500ms 触发 onLongPress，期间 pointerup 取消 */
+function __attachLongPress(el, onLongPress, onTap) {
+  let timer = null;
+  let fired = false;
+  let startX = 0, startY = 0;
+  el.addEventListener('pointerdown', (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    fired = false;
+    startX = e.clientX; startY = e.clientY;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      fired = true;
+      try { onLongPress(e); } catch (err) { console.warn(err); }
+    }, 500);
+  });
+  el.addEventListener('pointermove', (e) => {
+    if (fired) return;
+    if (Math.abs(e.clientX - startX) > 6 || Math.abs(e.clientY - startY) > 6) {
+      clearTimeout(timer); timer = null;
+    }
+  });
+  el.addEventListener('pointerup', (e) => {
+    clearTimeout(timer); timer = null;
+    if (fired) { e.stopPropagation(); e.preventDefault(); return; }
+    if (onTap) try { onTap(e); } catch (err) { console.warn(err); }
+  });
+  el.addEventListener('pointercancel', () => { clearTimeout(timer); timer = null; });
+}
+
+/* 打开抽屉 · v3（默认折叠 / 内嵌管理 / 隐藏与删除 / 拖拽排序 / 跨抽屉） */
+function __buildExDrawer(groups) {
+  const el = document.createElement('div');
+  el.className = 'pb-ex-drawer';
+  el.style.cssText =
+    'position:fixed; z-index:88; width:340px; max-height:min(560px,82vh); ' +
+    'background:linear-gradient(160deg, rgba(10,18,32,.98), rgba(16,26,48,.98)); ' +
+    'border:1px solid rgba(34,211,238,.42); border-radius:14px; ' +
+    'box-shadow:0 0 0 1px rgba(34,211,238,.12) inset, 0 0 40px rgba(34,211,238,.28), 0 20px 60px rgba(0,0,0,.7); ' +
+    'backdrop-filter:blur(20px) saturate(1.4); -webkit-backdrop-filter:blur(20px) saturate(1.4); ' +
+    'display:flex; flex-direction:column; overflow:hidden; ' +
+    'animation:selIn .16s cubic-bezier(.34,1.3,.64,1);';
+
+  let viewMode = 'normal';           // 'normal' | 'manage'
+  const expanded = new Set();        // 展开中的组 id（默认空 → 全折叠）
+
+  /* ---------- 小工具 ---------- */
+  function makeBtn(text, tip, active, onClick, danger) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = text;
+    b.title = tip || '';
+    b.style.cssText =
+      'flex:none; height:26px; padding:0 10px; border-radius:7px; ' +
+      'border:1px solid ' + (danger ? 'rgba(248,113,113,.4)' : (active ? '#22d3ee' : 'rgba(34,211,238,.24)')) + '; ' +
+      'background:' + (danger
+        ? 'rgba(248,113,113,.08)'
+        : (active ? 'linear-gradient(135deg,rgba(34,211,238,.32),rgba(168,85,247,.24))' : 'rgba(34,211,238,.06)')) + '; ' +
+      'color:' + (danger ? '#fca5a5' : (active ? '#fff' : '#7dd3fc')) + '; ' +
+      'font-family:inherit; font-size:11px; cursor:pointer; transition:all .15s;';
+    if (!active && !danger) {
+      b.addEventListener('mouseenter', () => {
+        b.style.background = 'rgba(34,211,238,.16)';
+        b.style.borderColor = '#22d3ee';
+        b.style.color = '#22d3ee';
+      });
+      b.addEventListener('mouseleave', () => {
+        b.style.background = 'rgba(34,211,238,.06)';
+        b.style.borderColor = 'rgba(34,211,238,.24)';
+        b.style.color = '#7dd3fc';
+      });
+    }
+    b.addEventListener('click', (e) => { e.stopPropagation(); onClick && onClick(); });
+    return b;
+  }
+
+  /* ---------- 头部 ---------- */
+  function renderHeader() {
+    const head = document.createElement('div');
+    head.style.cssText =
+      'flex:none; display:flex; align-items:center; gap:5px; padding:10px 12px; ' +
+      'border-bottom:1px solid rgba(34,211,238,.18); ' +
+      'background:linear-gradient(180deg, rgba(34,211,238,.07), transparent);';
+
+    const title = document.createElement('span');
+    title.textContent = viewMode === 'manage' ? '⚙ 抽屉管理' : '📚 函数抽屉';
+    title.style.cssText =
+      'flex:1; font-size:13px; color:#c9e4f5; font-weight:600; letter-spacing:.6px; ' +
+      'font-family:ui-monospace, Menlo, Consolas, monospace; ' +
+      'text-shadow:0 0 12px rgba(34,211,238,.35);';
+    head.appendChild(title);
+
+    if (viewMode === 'normal') {
+      head.appendChild(makeBtn('📋 提示词', '复制 AI 提示词', false, () => {
+        const text = (window.__pbFuncPlotter && window.__pbFuncPlotter.getAIPrompt)
+          ? window.__pbFuncPlotter.getAIPrompt() : '';
+        if (!text) return;
+        tryCopyToClipboard(text);
+        if (typeof toast === 'function') toast('已复制 AI 提示词到剪贴板', 2400);
+      }));
+      head.appendChild(makeBtn('＋ 新建', '新建抽屉', false, () => {
+        const name = prompt('新抽屉名称：', '我的函数');
+        if (!name) return;
+        if (window.__pbFuncPlotter) window.__pbFuncPlotter.addGroup(name);
+        render();
+      }));
+      head.appendChild(makeBtn('⚙ 管理', '进入管理模式', false, () => {
+        viewMode = 'manage';
+        render();
+      }));
+    } else {
+      head.appendChild(makeBtn('← 返回', '退出管理模式', false, () => {
+        viewMode = 'normal';
+        render();
+      }));
+    }
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.textContent = '✕';
+    closeBtn.style.cssText =
+      'flex:none; width:26px; height:26px; padding:0; border-radius:7px; border:none; ' +
+      'background:transparent; color:#8fa3c0; font-family:inherit; font-size:13px; ' +
+      'cursor:pointer; transition:all .15s;';
+    closeBtn.addEventListener('mouseenter', () => {
+      closeBtn.style.background = 'rgba(248,113,113,.2)';
+      closeBtn.style.color = '#fca5a5';
+    });
+    closeBtn.addEventListener('mouseleave', () => {
+      closeBtn.style.background = 'transparent';
+      closeBtn.style.color = '#8fa3c0';
+    });
+    closeBtn.addEventListener('click', () => __destroyExDrawer());
+    head.appendChild(closeBtn);
+
+    return head;
+  }
+
+  /* ---------- 拖拽条目（管理模式下） ---------- */
+  function setupChipDrag(chipEl, handleEl, g, it) {
+    let dragging = false, ghost = null, dropGid = null;
+    handleEl.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || viewMode !== 'manage') return;
+      e.preventDefault();
+      dragging = false;
+      dropGid = null;
+      const sx = e.clientX, sy = e.clientY;
+      const move = (ev) => {
+        if (!dragging && Math.hypot(ev.clientX - sx, ev.clientY - sy) > 6) {
+          dragging = true;
+          ghost = document.createElement('div');
+          ghost.textContent = '📌 ' + it.label;
+          ghost.style.cssText =
+            'position:fixed; z-index:99999; pointer-events:none; padding:6px 12px; ' +
+            'background:linear-gradient(135deg,#22d3ee,#a855f7); color:#fff; ' +
+            'border-radius:8px; font-size:12px; font-weight:600; ' +
+            'box-shadow:0 8px 24px rgba(34,211,238,.6); transform:translate(-50%,-50%);';
+          document.body.appendChild(ghost);
+        }
+        if (!dragging) return;
+        ghost.style.left = ev.clientX + 'px';
+        ghost.style.top = ev.clientY + 'px';
+        document.querySelectorAll('.pb-ex-drawer [data-group-id]').forEach((n) => {
+          n.style.outline = ''; n.style.background = ''; n.style.outlineOffset = '';
+        });
+        const hovered = document.elementFromPoint(ev.clientX, ev.clientY);
+        const groupEl = hovered && hovered.closest && hovered.closest('.pb-ex-drawer [data-group-id]');
+        if (groupEl) {
+          groupEl.style.outline = '2px dashed #22d3ee';
+          groupEl.style.outlineOffset = '3px';
+          groupEl.style.background = 'rgba(34,211,238,.10)';
+          dropGid = groupEl.dataset.groupId;
+        } else {
+          dropGid = null;
+        }
+      };
+      const up = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        if (ghost) ghost.remove();
+        document.querySelectorAll('.pb-ex-drawer [data-group-id]').forEach((n) => {
+          n.style.outline = ''; n.style.background = ''; n.style.outlineOffset = '';
+        });
+        if (dragging && dropGid && dropGid !== g.id && window.__pbFuncPlotter) {
+          window.__pbFuncPlotter.moveItem(g.id, it.id, dropGid, null);
+          if (typeof toast === 'function') toast('已移动「' + it.label + '」到其他抽屉', 1800);
+          render();
+        }
+        dragging = false;
+        dropGid = null;
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+    });
+  }
+
+  /* ---------- 单个组 ---------- */
+  function renderGroup(g) {
+    const wrap = document.createElement('div');
+    wrap.dataset.groupId = g.id;
+    wrap.style.cssText = 'margin-bottom:6px; border-radius:10px;';
+    const isManage = viewMode === 'manage';
+    const isOpen = expanded.has(g.id);
+    const isHidden = !!g.hidden;
+    if (isManage && isHidden) wrap.style.opacity = '0.7';
+
+    /* 组标题 */
+    const gBtn = document.createElement('button');
+    gBtn.type = 'button';
+    gBtn.style.cssText =
+      'width:100%; display:flex; align-items:center; gap:6px; padding:8px 10px; ' +
+      'border-radius:9px; ' +
+      'border:1px solid ' + (isOpen ? 'rgba(34,211,238,.5)' : 'rgba(34,211,238,.14)') + '; ' +
+      'background:' + (isOpen
+        ? 'linear-gradient(135deg,rgba(34,211,238,.15),rgba(168,85,247,.10))'
+        : 'rgba(34,211,238,.04)') + '; ' +
+      'color:' + (isOpen ? '#22d3ee' : (isHidden ? '#5a6a80' : '#c9e4f5')) + '; ' +
+      'font-family:inherit; font-size:12.5px; font-weight:500; text-align:left; cursor:pointer; ' +
+      'transition:all .15s;';
+    const gName = document.createElement('span');
+    gName.textContent = g.name + (g.builtin ? '' : ' ✱');
+    gName.style.cssText = 'flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+    gBtn.appendChild(gName);
+    const gCount = document.createElement('span');
+    gCount.textContent = String((g.items || []).length);
+    gCount.style.cssText =
+      'font-size:10.5px; color:#7dd3fc; padding:1px 6px; background:rgba(34,211,238,.10); ' +
+      'border-radius:6px; font-variant-numeric:tabular-nums;';
+    gBtn.appendChild(gCount);
+    const gArrow = document.createElement('span');
+    gArrow.textContent = '▸';
+    gArrow.style.cssText =
+      'color:#22d3ee; transition:transform .18s; font-size:10px; ' +
+      (isOpen ? 'transform:rotate(90deg);' : '');
+    gBtn.appendChild(gArrow);
+    gBtn.addEventListener('click', () => {
+      if (isOpen) expanded.delete(g.id); else expanded.add(g.id);
+      setTimeout(render, 0);  // ★ 延迟 0ms 重绘，完美避让事件循环
+    });
+    wrap.appendChild(gBtn);
+
+    /* 管理动作（组级） */
+    if (isManage) {
+      const acts = document.createElement('div');
+      acts.style.cssText = 'display:flex; gap:4px; margin:4px 0 0;';
+      acts.appendChild(makeBtn(
+        isHidden ? '👁 恢复显示' : '👁 隐藏抽屉',
+        isHidden ? '让这个抽屉重新出现在列表里' : '从主列表隐藏这个抽屉',
+        false,
+        () => {
+          if (window.__pbFuncPlotter && window.__pbFuncPlotter.setGroupHidden) {
+            window.__pbFuncPlotter.setGroupHidden(g.id, !g.hidden);
+          }
+          render();
+        }
+      ));
+      if (!g.builtin) {
+        acts.appendChild(makeBtn('↑', '上移', false, () => {
+          if (window.__pbFuncPlotter) window.__pbFuncPlotter.moveGroup(g.id, 'up');
+          render();
+        }));
+        acts.appendChild(makeBtn('↓', '下移', false, () => {
+          if (window.__pbFuncPlotter) window.__pbFuncPlotter.moveGroup(g.id, 'down');
+          render();
+        }));
+        acts.appendChild(makeBtn('✕ 删除', '删除抽屉', false, () => {
+          if (!confirm('删除抽屉「' + g.name + '」及其所有函数？')) return;
+          if (window.__pbFuncPlotter) window.__pbFuncPlotter.deleteGroup(g.id);
+          expanded.delete(g.id);
+          render();
+        }, true));
+      }
+      wrap.appendChild(acts);
+    }
+
+    /* 展开内容 */
+    if (isOpen) {
+      const bodyBox = document.createElement('div');
+      bodyBox.style.cssText = 'display:flex; flex-direction:column; gap:5px; padding:6px 0 4px;';
+
+      if (!g.items || !g.items.length) {
+        const empty = document.createElement('div');
+        empty.textContent = isManage
+          ? '（空）可把其他抽屉里的函数拖进来'
+          : '（空）在「⚙ 管理」里新增，或拖动函数到此处';
+        empty.style.cssText =
+          'padding:10px 12px; color:#6b7a90; font-size:11.5px; font-style:italic;';
+        bodyBox.appendChild(empty);
+      } else {
+        g.items.forEach((it) => {
+          if (it.hidden && !isManage) return;
+
+          const chip = document.createElement('div');
+          chip.style.cssText = 'position:relative;';
+
+          const chipBtn = document.createElement('button');
+          chipBtn.type = 'button';
+          chipBtn.title = it.code;
+          chipBtn.textContent = it.label;
+          chipBtn.style.cssText =
+            'width:100%; text-align:left; padding:8px 11px; ' +
+            'background:rgba(8,16,32,.55); ' +
+            'border:1px solid rgba(34,211,238,.16); border-radius:8px; ' +
+            'color:' + (it.hidden ? '#5a6a80' : '#c9e4f5') + '; ' +
+            'font-family:inherit; font-size:12px; line-height:1.4; ' +
+            'cursor:' + (isManage ? 'grab' : 'pointer') + '; ' +
+            'white-space:nowrap; overflow:hidden; text-overflow:ellipsis; ' +
+            'transition:all .15s; opacity:' + (it.hidden ? '.55' : '1') + ';';
+          if (!isManage) {
+            chipBtn.addEventListener('mouseenter', () => {
+              chipBtn.style.background = 'rgba(34,211,238,.15)';
+              chipBtn.style.color = '#22d3ee';
+              chipBtn.style.borderColor = 'rgba(34,211,238,.5)';
+            });
+            chipBtn.addEventListener('mouseleave', () => {
+              chipBtn.style.background = 'rgba(8,16,32,.55)';
+              chipBtn.style.color = '#c9e4f5';
+              chipBtn.style.borderColor = 'rgba(34,211,238,.16)';
+            });
+            chipBtn.addEventListener('click', () => {
+              if (!__exDrawerAnchor || !__exDrawerAnchor.input) return;
+              __appendToTextarea(__exDrawerAnchor.input, it.code);
+              chipBtn.style.background = 'rgba(74,222,128,.3)';
+              chipBtn.style.color = '#fff';
+              setTimeout(() => {
+                chipBtn.style.background = 'rgba(8,16,32,.55)';
+                chipBtn.style.color = '#c9e4f5';
+              }, 500);
+            });
+          }
+          chip.appendChild(chipBtn);
+
+          if (isManage) {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex; gap:4px; margin-top:3px;';
+
+            row.appendChild(makeBtn(it.hidden ? '👁 恢复' : '👁 隐藏', '', false, () => {
+              if (window.__pbFuncPlotter && window.__pbFuncPlotter.setItemHidden) {
+                window.__pbFuncPlotter.setItemHidden(g.id, it.id, !it.hidden);
+              }
+              render();
+            }));
+
+            if (!g.builtin && !it.builtin) {
+              row.appendChild(makeBtn('✕ 删除', '', false, () => {
+                if (!confirm('删除「' + it.label + '」？')) return;
+                if (window.__pbFuncPlotter) window.__pbFuncPlotter.deleteItem(g.id, it.id);
+                render();
+              }, true));
+            }
+            chip.appendChild(row);
+
+            setupChipDrag(chip, chipBtn, g, it);
+          }
+
+          bodyBox.appendChild(chip);
+        });
+      }
+      wrap.appendChild(bodyBox);
+    }
+
+    return wrap;
+  }
+
+  /* ---------- 主体 ---------- */
+  function render() {
+    el.innerHTML = '';
+    el.appendChild(renderHeader());
+
+    const body = document.createElement('div');
+    body.style.cssText =
+      'flex:1; overflow-y:auto; padding:8px 10px 12px; scrollbar-width:thin; ' +
+      'scrollbar-color: rgba(34,211,238,.4) transparent;';
+    body.className = 'pb-ex-drawer-body';
+
+    const all = (window.__pbFuncPlotter && window.__pbFuncPlotter.getGroups)
+      ? window.__pbFuncPlotter.getGroups() : [];
+    const visible = viewMode === 'manage' ? all : all.filter((g) => !g.hidden);
+
+    if (!visible.length) {
+      const empty = document.createElement('div');
+      empty.textContent = viewMode === 'manage'
+        ? '还没有任何抽屉 · 点上方「＋ 新建」开始'
+        : '（暂无可见抽屉 · 点上方「⚙ 管理」显示已隐藏的抽屉）';
+      empty.style.cssText =
+        'padding:34px 14px; text-align:center; color:#6b7a90; font-size:12px; line-height:1.8;';
+      body.appendChild(empty);
+    } else {
+      visible.forEach((g) => body.appendChild(renderGroup(g)));
+    }
+
+    el.appendChild(body);
+
+    // ★ 用 requestAnimationFrame 确保 DOM 高度计算完毕再定位，避免展开时跳动
+    requestAnimationFrame(() => {
+      if (typeof __positionExDrawer === 'function') __positionExDrawer();
+    });
+  }
+
+  el._render = render;
+  el._getViewMode = () => viewMode;
+  render();
+ document.body.appendChild(el);   // ★ 加上这一行，把抽屉挂载到页面上
+  return el;
+}
+
+/* 全局刷新入口（供 tagFuncSave 等外部调用） */
+window.__exDrawerElRefresh = function () {
+  if (__exDrawerEl && typeof __exDrawerEl._render === 'function') {
+    __exDrawerEl._render();
+  } else if (typeof __refreshDrawer === 'function') {
+    __refreshDrawer();
+  }
+};
+
+function __exDrawerOutsideHandler(e) {
+  if (__exDrawerMenuEl && __exDrawerMenuEl.contains(e.target)) return;
+  if (__exDrawerManagerEl && __exDrawerManagerEl.contains(e.target)) return;
+  if (__exDrawerEl && __exDrawerEl.contains(e.target)) return;
+  if (__exDrawerAnchor && __exDrawerAnchor.input && e.target === __exDrawerAnchor.input) return;
+  if (__exDrawerMenuEl) { __closeExDrawerMenu(); return; }
+  __destroyExDrawer();
+}
+
+/* 刷新：保持锚点，重建抽屉 */
+/* 刷新：优先原地重建（保留展开状态），失败再整体重建 */
+function __refreshDrawer() {
+  if (!__exDrawerEl || !__exDrawerAnchor) return;
+  if (typeof __exDrawerEl._render === 'function') {
+    __exDrawerEl._render();
+    if (typeof __positionExDrawer === 'function') __positionExDrawer();
+    return;
+  }
+  const input = __exDrawerAnchor.input;
+  const pd = __exDrawerAnchor.pd;
+  const groups = __normalizeExampleGroups(pd);
+  __exDrawerEl.remove();
+  __exDrawerEl = null;
+  const el = __buildExDrawer(groups);
+  __exDrawerEl = el;
+  if (typeof __positionExDrawer === 'function') __positionExDrawer();
+}
+window.__pbOpenFuncManager = function (anchorInput) {
+  const ta = anchorInput || document.querySelector('textarea[data-param-key="智能指令"]');
+  if (!ta) { if (typeof toast === 'function') toast('找不到函数输入框', 2200); return; }
+  __openManagerModal(ta);
+};
+
+/* 打开管理模态框 */
+function __openManagerModal(input) {
+  __closeExDrawerManager();
+  const mask = document.createElement('div');
+  mask.style.cssText =
+    'position:fixed; inset:0; z-index:10000; background:rgba(4,10,22,.72); ' +
+    'backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); ' +
+    'display:flex; align-items:center; justify-content:center; padding:20px;';
+
+  const card = document.createElement('div');
+  card.style.cssText =
+    'width:100%; max-width:640px; max-height:86vh; ' +
+    'background:linear-gradient(160deg,rgba(24,36,60,.98),rgba(14,22,40,.98)); ' +
+    'border:1px solid rgba(120,180,255,.28); border-radius:18px; ' +
+    'display:flex; flex-direction:column; overflow:hidden; ' +
+    'box-shadow:0 30px 80px rgba(0,8,24,.75);';
+
+  const head = document.createElement('div');
+  head.style.cssText =
+    'padding:14px 18px; border-bottom:1px solid rgba(120,180,255,.14); ' +
+    'display:flex; align-items:center; gap:10px;';
+  const title = document.createElement('span');
+  title.textContent = '⚙ 函数抽屉管理';
+  title.style.cssText = 'flex:1; font-size:15px; color:#fff; font-weight:600;';
+  head.appendChild(title);
+
+  const mkBtn = (text, handler, primary) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = text;
+    b.style.cssText =
+      'height:28px; padding:0 12px; border-radius:7px; ' +
+      'font-family:inherit; font-size:12px; cursor:pointer; ' +
+      (primary
+        ? 'background:linear-gradient(135deg,#38bdf8,#818cf8); color:#fff; border:none;'
+        : 'background:rgba(120,180,255,.08); color:#b8c7de; border:1px solid rgba(120,180,255,.22);');
+    b.addEventListener('click', handler);
+    return b;
+  };
+  head.appendChild(mkBtn('＋ 新建抽屉', () => {
+    const name = prompt('新抽屉名称：', '我的函数');
+    if (!name) return;
+    window.__pbFuncPlotter.addGroup(name);
+    renderList();
+    __refreshDrawer();
+  }, true));
+  head.appendChild(mkBtn('↺ 复原排列', () => {
+    if (confirm('确定复原所有顺序吗？内置将回到默认，自定义排末尾。')) {
+      if (window.__pbFuncPlotter && window.__pbFuncPlotter.resetOrder) {
+        window.__pbFuncPlotter.resetOrder();
+      }
+      renderList();
+      __refreshDrawer();
+      if (typeof toast === 'function') toast('顺序已复原', 1800);
+    }
+  }, true));
+
+  const closeBtn = mkBtn('✕', () => { mask.remove(); __exDrawerManagerEl = null; });
+  head.appendChild(closeBtn);
+  card.appendChild(head);
+
+  const body = document.createElement('div');
+  body.style.cssText = 'flex:1; overflow-y:auto; padding:12px 14px;';
+  card.appendChild(body);
+
+  function renderList() {
+    body.innerHTML = '';
+    const groups = window.__pbFuncPlotter.getGroups();
+    groups.forEach(g => {
+      const row = document.createElement('div');
+      row.style.cssText =
+        'padding:10px 12px; margin-bottom:8px; ' +
+        'background:rgba(120,180,255,.04); border:1px solid rgba(120,180,255,.14); ' +
+        'border-radius:10px;';
+
+      const hRow = document.createElement('div');
+      hRow.style.cssText = 'display:flex; align-items:center; gap:6px; margin-bottom:6px;';
+      const nm = document.createElement('div');
+      nm.textContent = g.name + (g.builtin ? '（内置）' : '');
+      nm.style.cssText = 'flex:1; font-size:13.5px; color:#fff; font-weight:500;';
+      hRow.appendChild(nm);
+
+      if (!g.builtin) {
+        hRow.appendChild(mkSmallBtn('↑', () => { window.__pbFuncPlotter.moveGroup(g.id, 'up'); renderList(); __refreshDrawer(); }));
+        hRow.appendChild(mkSmallBtn('↓', () => { window.__pbFuncPlotter.moveGroup(g.id, 'down'); renderList(); __refreshDrawer(); }));
+        hRow.appendChild(mkSmallBtn('✎', () => {
+          const nn = prompt('新名称：', g.name);
+          if (nn) { window.__pbFuncPlotter.renameGroup(g.id, nn); renderList(); __refreshDrawer(); }
+        }));
+        hRow.appendChild(mkSmallBtn('＋', () => {
+          const code = prompt('函数文本（可多行）：', 'y = x^2');
+          if (!code) return;
+          const label = prompt('名称（可留空）：', '') || '';
+          window.__pbFuncPlotter.addItem(g.id, label, code);
+          renderList(); __refreshDrawer();
+        }));
+        hRow.appendChild(mkSmallBtn('✕', () => {
+          if (!confirm('删除抽屉「' + g.name + '」及其所有函数？')) return;
+          window.__pbFuncPlotter.deleteGroup(g.id);
+          renderList(); __refreshDrawer();
+        }, true));
+      }
+      row.appendChild(hRow);
+
+      (g.items || []).forEach(it => {
+        const iRow = document.createElement('div');
+        iRow.style.cssText =
+          'display:flex; align-items:center; gap:6px; padding:4px 8px; ' +
+          'border-radius:6px; margin-top:3px; background:rgba(8,16,32,.5);';
+        const lb = document.createElement('span');
+        lb.textContent = it.label;
+        lb.title = it.code;
+        lb.style.cssText = 'flex:1; font-size:12px; color:#c8d5ea; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+        iRow.appendChild(lb);
+        if (!g.builtin) {
+          iRow.appendChild(mkSmallBtn('✎', () => {
+            const code = prompt('编辑文本：', it.code);
+            if (code == null) return;
+            const label = prompt('名称：', it.label);
+            if (label == null) return;
+            window.__pbFuncPlotter.updateItem(g.id, it.id, { label: label || it.label, code });
+            renderList(); __refreshDrawer();
+          }));
+          iRow.appendChild(mkSmallBtn('✕', () => {
+            if (!confirm('删除「' + it.label + '」？')) return;
+            window.__pbFuncPlotter.deleteItem(g.id, it.id);
+            renderList(); __refreshDrawer();
+          }, true));
+        }
+        row.appendChild(iRow);
+      });
+
+      body.appendChild(row);
+    });
+
+    /* 导入导出 */
+    const ioRow = document.createElement('div');
+    ioRow.style.cssText = 'display:flex; gap:8px; margin-top:12px; padding-top:12px; border-top:1px dashed rgba(120,180,255,.15);';
+    ioRow.appendChild(mkBtn('📤 导出 JSON', () => {
+      const text = window.__pbFuncPlotter.exportCustomGroups();
+      tryCopyToClipboard(text);
+      if (typeof toast === 'function') toast('已复制自定义抽屉 JSON 到剪贴板', 2200);
+    }));
+    ioRow.appendChild(mkBtn('📥 导入 JSON', () => {
+      const text = prompt('粘贴 JSON（会追加到现有自定义抽屉）：');
+      if (!text) return;
+      if (window.__pbFuncPlotter.importCustomGroups(text, false)) {
+        renderList(); __refreshDrawer();
+        if (typeof toast === 'function') toast('已导入', 1800);
+      } else {
+        alert('导入失败：JSON 格式不对');
+      }
+    }));
+    body.appendChild(ioRow);
+  }
+
+  function mkSmallBtn(text, handler, danger) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = text;
+    b.style.cssText =
+      'width:24px; height:24px; padding:0; border-radius:6px; ' +
+      'border:1px solid ' + (danger ? 'rgba(248,113,113,.4)' : 'rgba(120,180,255,.25)') + '; ' +
+      'background:' + (danger ? 'rgba(248,113,113,.1)' : 'rgba(120,180,255,.08)') + '; ' +
+      'color:' + (danger ? '#fca5a5' : '#7dd3fc') + '; ' +
+      'font-family:inherit; font-size:12px; cursor:pointer; flex:none;';
+    b.addEventListener('click', handler);
+    return b;
+  }
+
+  renderList();
+  mask.appendChild(card);
+  document.body.appendChild(mask);
+  __exDrawerManagerEl = mask;
+}
+
+function tryCopyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(() => {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (e) {}
+      ta.remove();
+    });
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    ta.remove();
+  }
+}
+
+/* 主入口：给 textarea 绑定点击 → 打开抽屉 · 容错版 */
+/* 主入口：给 textarea 绑定点击 → 打开抽屉 · 容错版 */
+function __attachExDrawerToTextarea(input, pd) {
+  if (input.__pbExBound) return;
+  input.__pbExBound = true;
+
+  input.addEventListener('click', () => {
+    // 再点一次同输入框 = 关闭
+    if (__exDrawerEl && __exDrawerAnchor && __exDrawerAnchor.input === input) {
+      __destroyExDrawer();
+      return;
+    }
+
+    __destroyExDrawer();
+    __exDrawerAnchor = { input, pd };
+
+    // 每次打开时重新计算 groups
+    const groups = __normalizeExampleGroups(pd);
+
+    // 诊断日志（打开 F12 就能看到问题）
+    console.log(
+      '[funcDrawer] 打开抽屉：',
+      'groups=', groups.length,
+      '| __pbFuncPlotter=', !!window.__pbFuncPlotter,
+      '| pd.exampleGroups=',
+      (pd && pd.exampleGroups) ? pd.exampleGroups.length : 'undefined'
+    );
+
+    if (!groups.length) {
+      const hasApi = !!(window.__pbFuncPlotter && typeof window.__pbFuncPlotter.getGroups === 'function');
+      const hasLegacy = !!(pd && Array.isArray(pd.exampleGroups) && pd.exampleGroups.length);
+      let msg = '抽屉打不开：';
+      if (!hasApi && !hasLegacy) {
+        msg += '未检测到 window.__pbFuncPlotter 和 exampleGroups，请检查 shapes-self.js 是否加载成功（F12 查看红色报错）';
+      } else if (hasApi && !hasLegacy) {
+        msg += 'window.__pbFuncPlotter.getGroups() 返回空，请检查数据层';
+      } else {
+        msg += '数据异常，请打开 F12 查看 [funcDrawer] 日志';
+      }
+      if (typeof toast === 'function') toast(msg, 6000);
+      console.error('[funcDrawer] 诊断信息', {
+        api: window.__pbFuncPlotter,
+        groupsResult: (function () {
+          try { return window.__pbFuncPlotter.getGroups(); }
+          catch (e) { return 'ERROR: ' + (e && e.message); }
+        })(),
+        pdExampleGroups: pd && pd.exampleGroups
+      });
+      return;
+    }
+
+    const el = __buildExDrawer(groups);
+    __exDrawerEl = el;
+    __positionExDrawer();
+  });
+  
+} // ★★★ 就是这行大括号，你刚才的代码里漏掉了它！
+
+
+
 function buildParamsPanel() {
   const one = selection[0];
   if (!one) return;
@@ -4459,6 +6412,78 @@ function buildParamsPanel() {
       });
       block.append(label, btn);
     }
+    /* ===== 单行 / 多行文本框 ===== */
+    else if (pd.type === 'text' || pd.type === 'string' || pd.type === 'textarea') {
+      const label = document.createElement('div');
+      label.className = 'plabel';
+      label.textContent = pd.label;
+
+      const isMulti = pd.type === 'textarea';
+      const inp = document.createElement(isMulti ? 'textarea' : 'input');
+      if (!isMulti) inp.type = 'text';
+      inp.className = 'gm-input';
+      inp.value = one[key] == null ? '' : one[key];
+      inp.style.fontFamily = 'ui-monospace, Menlo, Consolas, monospace';
+      inp.style.fontSize = '13px';
+      inp.style.letterSpacing = '0';
+      if (pd.placeholder) inp.placeholder = pd.placeholder;
+      if (isMulti) {
+        inp.rows = pd.rows || 3;
+        inp.style.height = 'auto';
+        inp.style.minHeight = ((pd.rows || 3) * 20 + 16) + 'px';
+        inp.style.resize = 'vertical';
+        inp.style.paddingTop = '8px';
+        inp.style.paddingBottom = '8px';
+      }
+
+      /* ★ 新增：给 textarea 加 data-param-key，供外部脚本（shapes-self.js）精确定位 */
+      inp.dataset.paramKey = key;
+
+      let timer = null;
+      const commit = () => {
+        one[key] = inp.value;
+        if (isTextObj(one)) measureText(one);
+        render(); drawPreview();
+      };
+      inp.addEventListener('input', () => {
+        clearTimeout(timer);
+        timer = setTimeout(commit, 180);
+      });
+      inp.addEventListener('change', () => { clearTimeout(timer); commit(); });
+      if (!isMulti) {
+        inp.addEventListener('keydown', e => {
+          if (e.key === 'Enter') { e.preventDefault(); clearTimeout(timer); commit(); }
+        });
+      }
+
+      block.append(label, inp);
+
+      /* 若该参数带 examples / exampleGroups，点击 textarea 时弹出示例抽屉 */
+      if (typeof __attachExDrawerToTextarea === 'function') {
+        __attachExDrawerToTextarea(inp, pd);
+      }
+    }
+    /* ★ 新增：按钮类型 */
+    else if (pd.type === 'button') {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'mbtn';
+      btn.style.cssText =
+        'width:100%; height:38px; margin-top:4px; font-size:13px; ' +
+        (pd.danger ? 'background:linear-gradient(135deg,#f87171,#ef4444);' : '');
+      btn.textContent = pd.label || '按钮';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        try {
+          if (typeof pd.action === 'function') pd.action(one, e);
+        } catch (err) {
+          console.error('[param button]', err);
+          if (typeof toast === 'function') toast('操作失败：' + (err && err.message ? err.message : err), 3000);
+        }
+      });
+      block.appendChild(btn);
+    }
+    /* ===== range 滑杆分支 ===== */
     else {
       const label = document.createElement('div');
       label.className = 'plabel';
@@ -4478,6 +6503,7 @@ function buildParamsPanel() {
     paramsBody.appendChild(block);
   }
 }
+
 function applyToSelection(fn) {
   for (const o of selection) fn(o);
   pages[pageIndex] = objects;
@@ -4493,7 +6519,7 @@ let __enhVersion = 0;
 function loadImageFromSrc(src) {
   return new Promise((res, rej) => {
     const im = new Image();
-    im.onload = () => res(im);
+    im.onload = () => res(im);       // ← 干净版本
     im.onerror = rej;
     im.src = src;
   });
@@ -4752,6 +6778,7 @@ function createShapeAt(p) {
     }
   }
   if (def.animatable) { o.animT = 0; o.animPlaying = false; o.animSpeed = 1; }
+if (def.defaultSize) { o.x2 = o.x1 + def.defaultSize.w; o.y2 = o.y1 + def.defaultSize.h; }
   return o;
 }
 function isMeaningful(o) {
@@ -5029,6 +7056,83 @@ function snapTriAngle(x1, y1, x2, y2) {
 /* =====================================================================
  * 21. 指针交互
  * ===================================================================== */
+function tryStartInteractiveDrag(pt, e) {
+  if (e.ctrlKey || e.metaKey) return false;   // Ctrl 用于克隆拖动
+
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const o = objects[i];
+    const d = PB.shapes[o.type];
+    if (!d || !d.interactive) continue;
+    if (!hitTest(o, pt)) continue;
+
+    /* 已选中 + 落在控制点/顶点上 → 交回 selectDown（缩放 / 旋转） */
+    if (selection.length === 1 && selection[0] === o) {
+      if (hitHandle(o, pt) || hitVertex(o, pt) !== null) return false;
+    }
+
+    /* ★ 新增：靠近外边框 → 移动整体（不改视图） */
+    const b = getBBox(o);
+    const k = 1 / view.scale;
+    const edgeBand = Math.min(12 * k, Math.min(b.w, b.h) * 0.15);
+    const minDist = Math.min(
+      pt.x - b.x1, b.x2 - pt.x,
+      pt.y - b.y1, b.y2 - pt.y
+    );
+    if (e.altKey || minDist < edgeBand) {
+      return false;   // 交回 selectDown 走 move 分支
+    }
+
+
+    /* ★ 优先让图形自己处理点击（滑杆、按钮等内部控件） */
+    if (typeof d.onClick === 'function') {
+      const handled = d.onClick(o, {
+        worldPt: pt,
+        requestRedraw: () => { render(); drawPreview(); }
+      });
+      if (handled) {
+        interactiveDrag = {
+          obj: o,
+          startPt: pt,
+          startView: Object.assign({}, o._view),
+          gestureHandled: true
+        };
+        drawing = true;
+        setCursor('grabbing');
+        if (selection.length !== 1 || selection[0] !== o) {
+          selection = [o];
+          updateSelBar();
+        }
+        return true;
+      }
+    }
+
+
+
+    /* 内部拖动 → 平移视图 */
+    if (!o._view) o._view = { cx: 0, cy: 0, xHalf: 6, yHalf: 4 };
+    if (typeof o._bw !== 'number' || typeof o._bh !== 'number') {
+      o._bw = b.w; o._bh = b.h;
+    }
+    if (typeof o._bx1 !== 'number') o._bx1 = b.x1;
+    if (typeof o._by1 !== 'number') o._by1 = b.y1;
+
+    interactiveDrag = {
+      obj: o,
+      startPt: pt,
+      startView: Object.assign({}, o._view)
+    };
+    drawing = true;
+    setCursor('grabbing');
+    if (selection.length !== 1 || selection[0] !== o) {
+      selection = [o];
+      updateSelBar();
+    }
+    return true;
+  }
+  return false;
+}
+
+
 function onPointerDown(e) {
   if (e.pointerType === 'mouse') {
     if (e.button === 1) {
@@ -5065,17 +7169,34 @@ function onPointerDown(e) {
     }
   }
 
-  if (textEditorEl && !textEditorEl.contains(e.target)) {
-    commitTextEditor();
+if (textEditorEl) {
+  const isMathLive = e.target && e.target.closest && (
+    e.target.closest('math-field') || 
+    e.target.closest('math-virtual-keyboard') || 
+    e.target.closest('.ML__keyboard') ||
+    e.target.closest('.ML__popover')
+  );
+
+  /* ★ 新增：允许点击 / 拖拽 ghost 浮块，不关闭编辑器 */
+  const isGhost = e.target && e.target.closest && e.target.closest('.te-formula-ghost');
+
+  if (textEditorEl.contains(e.target) || isMathLive || isGhost) {
     return;
   }
+
+  commitTextEditor();
+  return;
+}
 
   if (!onCanvas) return;
   e.preventDefault();
   hideMenu();
 
   const pt = screenToWorld(e.clientX, e.clientY);
-  if (state.tool === 'select') selectDown(pt, e);
+if (state.tool === 'select') {
+  if (tryStartInteractiveDrag(pt, e)) return;   // ★ 新增
+  selectDown(pt, e);
+}
   else if (state.tool === 'pen') penDown(pt);
   else if (state.tool === 'eraser') eraseStart(e);
   else if (isShapeTool(state.tool)) shapeDown(pt);
@@ -5118,11 +7239,42 @@ function onPointerMove(e) {
     return;
   }
 
+  /* ★ 新增：图形内交互平移 */
+  if (interactiveDrag) {
+    const pt = screenToWorld(e.clientX, e.clientY);
+    const o = interactiveDrag.obj;
+    const def = PB.shapes[o.type];
+
+    /* ★ 优先交给图形自己的 onDrag 处理 */
+    if (def && typeof def.onDrag === 'function') {
+      const handled = def.onDrag(o, {
+        worldPt: pt,
+        startPt: interactiveDrag.startPt,
+        requestRedraw: () => { render(); drawPreview(); }
+      });
+      if (handled) {
+        render(); drawPreview();
+        if (selBar.classList.contains('show')) updateSelBarPosition();
+        return;
+      }
+    }
+
+
+    if (def && typeof def.onPan === 'function' && interactiveDrag.startView) {
+      def.onPan(o,
+        pt.x - interactiveDrag.startPt.x,
+        pt.y - interactiveDrag.startPt.y,
+        interactiveDrag.startView);
+    }
+    render(); drawPreview();
+    if (selBar.classList.contains('show')) updateSelBarPosition();
+    return;
+  }
+
   if (!drawing) {
     if (state.tool === 'select' && e.target.tagName === 'CANVAS') hoverCursor(e);
     return;
   }
-
   const pt = screenToWorld(e.clientX, e.clientY);
   if (state.tool === 'select') { selectMove(pt, e); return; }
   if (!current) return;
@@ -5222,6 +7374,26 @@ function onPointerUp(e) {
   }
 
   if (!drawing) return;
+
+  /* ★ 新增：结束图形内交互 */
+  if (interactiveDrag) {
+    const o = interactiveDrag.obj;
+    const def = o && PB.shapes[o.type];
+    if (def && typeof def.onDragEnd === 'function') {
+      try {
+        def.onDragEnd(o, {
+          requestRedraw: () => { render(); drawPreview(); }
+        });
+      } catch (err) { console.warn('[interactiveDrag] onDragEnd 出错：', err); }
+    }
+    interactiveDrag = null;
+    drawing = false;
+    setCursor(state.tool === 'select' ? 'default' : 'crosshair');
+    render(); drawPreview();
+    return;
+  }
+
+
   if (erasing) { eraseEnd(); endSnap(); return; }
   endSnap();
   drawing = false;
@@ -5528,6 +7700,35 @@ function hoverCursor(e) {
   let cur = 'default';
   if (state.tool === 'pen' || isShapeTool(state.tool)) cur = 'crosshair';
   else if (state.tool === 'select') {
+
+    /* ★ 交互图形优先 */
+    for (let i = objects.length - 1; i >= 0; i--) {
+      const o = objects[i];
+      const d = PB.shapes[o.type];
+      if (!d || !d.interactive) continue;
+      if (!hitTest(o, pt)) continue;
+
+      if (selection.length === 1 && selection[0] === o &&
+          (hitVertex(o, pt) !== null || hitHandle(o, pt))) break;
+
+      /* 边框带 / Alt → move；内部 → grab */
+      const b = getBBox(o);
+      const k = 1 / view.scale;
+      const edgeBand = Math.min(12 * k, Math.min(b.w, b.h) * 0.15);
+      const minDist = Math.min(
+        pt.x - b.x1, b.x2 - pt.x,
+        pt.y - b.y1, b.y2 - pt.y
+      );
+
+      if (e.altKey || minDist < edgeBand) {
+        setCursor(cloneMode ? 'copy' : 'move');
+      } else {
+        setCursor('grab');
+      }
+      return;
+    }
+    /* ★ 交互图形优先结束 */
+
     if (selection.length === 1) {
       const o = selection[0];
       if (hitVertex(o, pt) !== null) cur = 'pointer';
@@ -5550,7 +7751,6 @@ function hoverCursor(e) {
   }
   setCursor(cur);
 }
-
 board.addEventListener('dblclick', e => {
   if (textEditorEl) return;
   const pt = screenToWorld(e.clientX, e.clientY);
@@ -5677,6 +7877,27 @@ window.addEventListener('wheel', e => {
     return;
   }
 
+  /* ★ 新增：图形内滚轮缩放（必须在下面 eraser 判断之前） */
+  if (state.tool === 'select' && e.target.tagName === 'CANVAS') {
+    const pt = screenToWorld(e.clientX, e.clientY);
+    for (let i = objects.length - 1; i >= 0; i--) {
+      const o = objects[i];
+      const d = PB.shapes[o.type];
+      if (d && d.interactive && typeof d.onWheel === 'function' && hitTest(o, pt)) {
+        e.preventDefault();
+        d.onWheel(o, {
+          deltaY: e.deltaY, deltaX: e.deltaX,
+          shiftKey: e.shiftKey, altKey: e.altKey,
+          worldPt: pt
+        });
+        render(); drawPreview();
+        if (selBar.classList.contains('show')) updateSelBarPosition();
+        return;
+      }
+    }
+  }
+  /* ★ 新增结束 */
+
   if (state.tool !== 'eraser') return;
   if (e.target.tagName !== 'CANVAS') return;
   e.preventDefault();
@@ -5696,6 +7917,8 @@ function applyBg(id) {
   }
   const preset = findBgPreset(id);
   state.bg = preset.id;
+  /* 浅色背景 → 给 body 加 pb-light，文字编辑器 / 公式键盘切浅色 */
+  document.body.classList.toggle('pb-light', !!preset.light);
   document.body.style.background = (preset.id === 'transparent') ? 'transparent' : preset.css;
   try { localStorage.setItem('pb_bg_id', preset.id); } catch (e) {
     console.warn('[applyBg] 保存背景失败（可能是 localStorage 已满）:', e);
@@ -5717,6 +7940,8 @@ function applyBg(id) {
   }
   buildPenPanel();
   buildBorderPanel();
+  /* 同步已打开的文字编辑器 iframe */
+  syncEmbeddedEditorsTheme();
 }
 
 
@@ -6591,6 +8816,12 @@ function serializeObject(o) {
   delete t._origImg;
   delete t._videoEl;
   delete t._blobUrl;
+  delete t._lineData;          // ← 新增
+  delete t._lineDataFs;        // ← 新增
+  delete t._lineDataColor;     // ← 新增
+  delete t._bw;           // ★ 新增
+  delete t._bh;           // ★ 新增
+  delete t._viewScale;    // ★ 新增
   if (o._mask) {
     try { t._maskData = o._mask.toDataURL('image/png'); } catch (e) {}
     t._maskPad = o._maskPad || MASK_PAD;
@@ -7126,6 +9357,8 @@ function createWidget(appId, title, iconSvg) {
   }
   const el = document.createElement('div');
   el.className = 'widget';
+  // 阻止内部点击事件冒泡到全局，防止触发 canvas 的拖拽或关闭逻辑
+  el.addEventListener('pointerdown', e => e.stopPropagation());
   el.dataset.app = appId;
   const offset = widgetSpawnCount % 6;
   widgetSpawnCount++;
@@ -8034,6 +10267,12 @@ async function saveDocToDisk() {
 }
 
 async function setupWindowControls() {
+  /* 先解绑 license.js 在激活前绑定的简单监听，避免点击触发两次 */
+  try {
+    if (window.__pbLicense && typeof window.__pbLicense.cleanupEarlyWindowControls === 'function') {
+      window.__pbLicense.cleanupEarlyWindowControls();
+    }
+  } catch (e) {}
   const T = window.__TAURI__;
   const internals = window.__TAURI_INTERNALS__;
 
@@ -8333,14 +10572,23 @@ function execShapesCode(code) {
 async function init() {
   await setupWindowControls();
 
-  if (!window.__pbLicense) {
-    document.body.innerHTML =
-      '<div style="max-width:520px;margin:100px auto;padding:30px;' +
-      'color:#fca5a5;font-family:system-ui;">授权模块缺失</div>';
+  // 【修补】加一层隐藏的检查
+  let licensed = false;
+  try {
+    // 检查对象是否被篡改（比如被替换成了普通对象，而不是经过 Object.defineProperty 定义的）
+    const desc = Object.getOwnPropertyDescriptor(window, '__pbLicense');
+    if (desc && !desc.writable && window.__pbLicense && typeof window.__pbLicense.ensureActivated === 'function') {
+      licensed = await window.__pbLicense.ensureActivated();
+    }
+  } catch (e) {
+    console.error(e);
+  }
+
+  if (!licensed) {
+    // 故意给一个看起来像网络错误的提示，忽悠试图破解的人
+    document.body.innerHTML = '<div style="color:#fff;margin:100px;">系统初始化失败，请检查网络或联系管理员（错误代码: 0x80070005）</div>';
     return;
   }
-  const licensed = await window.__pbLicense.ensureActivated();
-  if (!licensed) return;
 
   try {
     await ensureShapesReady();
@@ -8370,24 +10618,25 @@ if (savedBg === 'custom' && !loadCustomBgPreset()) {
 const restoredPreset = findBgPreset(savedBg);
 state.bg = restoredPreset.id;
 
-// 提取为可重入函数，用于二次应用（修复 Tauri 时序问题）
-const applyRestoredBg = function () {
-  if (state.bg === 'transparent') {
-    document.body.style.background = 'transparent';
-  } else {
-    document.body.style.background = restoredPreset.css;
-  }
-};
-applyRestoredBg();
+        const applyRestoredBg = function () {
+          if (state.bg === 'transparent') {
+            document.body.style.background = 'transparent';
+          } else {
+            document.body.style.background = restoredPreset.css;
+          }
+          document.body.classList.toggle('pb-light', !!restoredPreset.light);
+        };
+        applyRestoredBg();
 
-if (state.bg === 'transparent') {
-  state.borderColor = '#ff0000'; state.penColor = '#ff0000';
-} else if (restoredPreset.light) {
-  state.borderColor = '#1a1a1a'; state.penColor = '#1a1a1a';
-} else {
-  state.borderColor = '#e6edf7'; state.penColor = '#e6edf7';
-}
-await preloadBgImage();
+        if (state.bg === 'transparent') {
+          state.borderColor = '#ff0000'; state.penColor = '#ff0000';
+        } else if (restoredPreset.light) {
+          state.borderColor = '#1a1a1a'; state.penColor = '#1a1a1a';
+        } else {
+          state.borderColor = '#e6edf7'; state.penColor = '#e6edf7';
+        }
+
+        await preloadBgImage();
   ensureTextShapes();
   registerTextParams();
 
@@ -8466,7 +10715,7 @@ applyLibHidden();
   registerAnimParams();
 
 setTool('pen', true);
-
+  syncEmbeddedEditorsTheme();
 // ★ 修复：Tauri WebView 在 init 早期设置 body.style.background 后，
 // 可能会因 DOM 重绘、canvas 尺寸变化等丢失样式；用 requestAnimationFrame
 // 在下一帧再应用一次，确保背景稳定生效。
@@ -8476,7 +10725,44 @@ requestAnimationFrame(function () {
 
 setTimeout(() => toast('已进入画笔状态 · 菜单里可导入图片 / 视频', 600), 400);
 }
+/* =====================================================================
+ * 26.6 公式抽屉 · 自定义数据文件读写路由
+ *     latex-formula-editor（iframe）通过 postMessage 请求读写
+ *     custom-formulas.json（与 shapes.js 同目录）
+ * ===================================================================== */
+(function setupCustomFormulaFSBridge() {
+  window.addEventListener('message', async (e) => {
+    const data = e.data;
+    if (!data || !data.id) return;
+    if (data.type !== 'pb:read-custom-formulas' &&
+        data.type !== 'pb:write-custom-formulas') return;
 
+    const reply = (msg) => {
+      try { if (e.source) e.source.postMessage(msg, '*'); } catch (err) {}
+    };
+
+    try {
+      const fs = window.__pbFS || {
+        readFile:  async n => localStorage.getItem('__pb_' + n),
+        writeFile: async (n, v) => localStorage.setItem('__pb_' + n, v)
+      };
+
+      if (data.type === 'pb:read-custom-formulas') {
+        const text = await fs.readFile('custom-formulas.json');
+        reply({ id: data.id, result: text || '' });
+      } else {
+        const text = (data.data && data.data.text) || '';
+        await fs.writeFile('custom-formulas.json', text);
+        reply({ id: data.id, result: true });
+      }
+    } catch (err) {
+      reply({
+        id: data.id,
+        error: String(err && err.message ? err.message : err)
+      });
+    }
+  });
+})();
 window.__pbRedraw = function () {
   render();
   drawPreview();
@@ -8489,7 +10775,7 @@ window.PhysBoard.setTool = setTool;              // 允许外部切工具
 window.PhysBoard.getCurrentTool = function () {  // 允许外部查当前工具
   return state.tool;
 };
-
+window.PhysBoard.getSelection = function () { return selection; };   // ★ 新增
 init();
 
 })();
