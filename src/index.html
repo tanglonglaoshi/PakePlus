@@ -735,6 +735,162 @@
     max-width:80vw;text-align:center;
   }
 
+  /* ===== PDF 导入预览 ===== */
+  .pdf-import-card{max-width:960px;width:min(960px,94vw);}
+  .pdf-file-name{
+    margin-left:auto;max-width:46%;font-size:12px;font-weight:400;
+    color:var(--text-dim);letter-spacing:.2px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .pdf-import-body{
+    display:flex;gap:16px;height:min(70vh,680px);
+    padding:10px 24px 6px;
+    overflow:hidden;
+  }
+  .pdf-preview-pane{
+    flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;gap:8px;
+    padding:10px;border-radius:14px;
+    border:1px solid rgba(120,180,255,.16);
+    background:
+      radial-gradient(ellipse 80% 60% at 50% 0%, rgba(56,189,248,.10), transparent 70%),
+      repeating-linear-gradient(0deg, transparent 0 22px, rgba(120,180,255,.035) 22px 23px),
+      repeating-linear-gradient(90deg, transparent 0 22px, rgba(120,180,255,.035) 22px 23px),
+      #0a1428;
+    box-shadow:inset 0 0 40px rgba(0,0,0,.45);
+  }
+  .pdf-preview-stage{
+    position:relative;flex:1;min-height:0;display:flex;align-items:center;justify-content:center;
+    overflow:hidden;
+  }
+  .pdf-preview-stage canvas{
+    position:static;inset:auto;z-index:auto;
+    display:block;max-width:100%;max-height:100%;
+    background:#fff;border-radius:3px;
+    box-shadow:0 14px 38px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.10);
+  }
+  .pdf-preview-loading{
+    position:absolute;inset:0;display:none;align-items:center;justify-content:center;gap:8px;
+    background:rgba(8,16,30,.55);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
+    color:#bae6fd;font-size:12.5px;border-radius:8px;
+  }
+  .pdf-preview-loading.show{display:flex;}
+  .pdf-preview-loading span{
+    width:16px;height:16px;border-radius:50%;
+    border:2px solid rgba(56,189,248,.25);border-top-color:#38bdf8;
+    animation:pdfSpin .7s linear infinite;
+  }
+  @keyframes pdfSpin{to{transform:rotate(360deg);}}
+  .pdf-preview-foot{flex:none;display:flex;align-items:center;justify-content:center;gap:12px;}
+  .pdf-nav{
+    width:28px;height:28px;border-radius:9px;cursor:pointer;
+    border:1px solid rgba(120,180,255,.2);background:rgba(120,180,255,.08);
+    color:var(--text);font-size:16px;line-height:1;display:grid;place-items:center;
+    transition:background .15s,border-color .15s,opacity .15s;font-family:inherit;
+  }
+  .pdf-nav:hover:not(:disabled){background:rgba(120,180,255,.2);border-color:rgba(120,180,255,.4);}
+  .pdf-nav:disabled{opacity:.3;cursor:default;}
+  .pdf-page-label{font-size:12px;color:var(--text-dim);min-width:76px;text-align:center;font-variant-numeric:tabular-nums;}
+  .pdf-side{
+    width:232px;flex:none;display:flex;flex-direction:column;gap:14px;
+    min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;
+  }
+  .pdf-side::-webkit-scrollbar{width:6px;}
+  .pdf-side::-webkit-scrollbar-thumb{background:rgba(120,180,255,.25);border-radius:3px;}
+
+  /* ===== 右上角滚轮平移锁 ===== */
+  .wheel-lock{
+    position:fixed;right:20px;top:20px;z-index:66;
+    width:44px;height:44px;border-radius:14px;border:1px solid var(--panel-border);
+    background:var(--panel-bg);backdrop-filter:blur(20px) saturate(1.3);-webkit-backdrop-filter:blur(20px) saturate(1.3);
+    color:var(--text-dim);cursor:pointer;display:grid;place-items:center;
+    box-shadow:var(--shadow);
+    transition:background .18s,color .18s,box-shadow .2s,transform .12s,right .25s;
+  }
+  .wheel-lock:hover{background:rgba(120,180,255,.14);color:var(--text);}
+  .wheel-lock:active{transform:scale(.94);}
+  .wheel-lock svg{width:20px;height:20px;}
+  .wheel-lock .wl-open{display:none;}
+  .wheel-lock.unlocked{
+    color:#7dd3fc;border-color:rgba(56,189,248,.55);
+    box-shadow:0 0 0 1px rgba(56,189,248,.22) inset,0 0 22px rgba(56,189,248,.30),var(--shadow);
+  }
+  .wheel-lock.unlocked .wl-closed{display:none;}
+  .wheel-lock.unlocked .wl-open{display:block;}
+  .wheel-lock .wl-tip{
+    position:absolute;top:50%;right:calc(100% + 10px);transform:translateY(-50%);
+    white-space:nowrap;font-size:12px;color:var(--text);background:rgba(10,20,36,.95);
+    border:1px solid var(--panel-border-2);padding:6px 10px;border-radius:9px;
+    opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;
+    box-shadow:0 8px 24px rgba(0,8,24,.5);
+  }
+  .wheel-lock:hover .wl-tip{opacity:1;transform:translateY(-50%) translateX(-2px);}
+  body.thumbs-open .wheel-lock{right:292px;}
+
+  /* ===== 形状网格：滑动切类别 ===== */
+  .shape-grid-wrap{position:relative;}
+  .shape-grid{
+    transition:transform .18s cubic-bezier(.22,.61,.36,1), opacity .18s ease;
+    will-change:transform, opacity;
+  }
+  .shape-grid.swiping{transition:none;}
+  .shape-grid.cat-leave-left{transform:translateX(-26px);opacity:0;}
+  .shape-grid.cat-leave-right{transform:translateX(26px);opacity:0;}
+  .shape-grid.cat-enter-left{transform:translateX(-26px);opacity:0;transition:none;}
+  .shape-grid.cat-enter-right{transform:translateX(26px);opacity:0;transition:none;}
+  .shape-cat-hint{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) scale(.92);
+    padding:7px 16px;border-radius:10px;max-width:82%;
+    background:rgba(10,20,36,.92);border:1px solid rgba(56,189,248,.42);
+    color:#bae6fd;font-size:13px;font-weight:500;letter-spacing:.4px;
+    box-shadow:0 10px 28px rgba(0,8,24,.55),0 0 20px rgba(56,189,248,.18);
+    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    opacity:0;pointer-events:none;z-index:3;
+    transition:opacity .15s ease, transform .15s ease;
+  }
+  .shape-cat-hint.show{opacity:1;transform:translate(-50%,-50%) scale(1);}
+
+  /* ===== 形状面板锁定 ===== */
+  #shapeBtn .dbtn-lock{
+    display:none;position:absolute;top:5px;right:7px;width:13px;height:13px;
+    color:#fbbf24;pointer-events:none;
+  }
+  #shapeBtn .dbtn-lock svg{width:100%;height:100%;}
+  #shapeBtn.locked{
+    color:#fde68a;
+    box-shadow:0 0 0 1px rgba(251,191,36,.55) inset,0 0 18px rgba(251,191,36,.22);
+  }
+  #shapeBtn.locked .dbtn-lock{display:block;}
+  .shape-panel.locked{
+    border-color:rgba(251,191,36,.42);
+    box-shadow:0 0 0 1px rgba(251,191,36,.14) inset,var(--shadow),0 0 26px rgba(251,191,36,.12);
+  }
+
+  #__pageBgHint{
+    position:fixed;left:50%;top:84px;transform:translateX(-50%);
+    z-index:860;display:flex;align-items:center;gap:12px;
+    max-width:min(780px,92vw);padding:10px 10px 10px 16px;
+    background:rgba(10,20,36,.94);border:1px solid rgba(56,189,248,.38);
+    border-radius:14px;box-shadow:0 14px 44px rgba(0,8,24,.6),0 0 26px rgba(56,189,248,.16);
+    backdrop-filter:blur(18px) saturate(1.3);-webkit-backdrop-filter:blur(18px) saturate(1.3);
+    color:var(--text);font-size:13px;line-height:1.5;
+    animation:bgHintIn .26s cubic-bezier(.34,1.3,.64,1);
+    transition:opacity .35s ease,transform .35s ease;
+  }
+  #__pageBgHint.hide{opacity:0;transform:translateX(-50%) translateY(-10px);}
+  #__pageBgHint b{flex:none;color:#7dd3fc;font-weight:600;letter-spacing:.3px;}
+  #__pageBgHint > span{color:#b8c7de;}
+  #__pageBgHint button{
+    flex:none;width:26px;height:26px;border:none;border-radius:8px;cursor:pointer;
+    background:transparent;color:var(--text-dim);font-size:17px;line-height:1;
+    display:grid;place-items:center;transition:background .15s,color .15s;
+  }
+  #__pageBgHint button:hover{background:rgba(248,113,113,.18);color:#fca5a5;}
+  @keyframes bgHintIn{
+    from{opacity:0;transform:translateX(-50%) translateY(-10px);}
+    to{opacity:1;transform:translateX(-50%) translateY(0);}
+  }
+
   #widgetLayer{
     position:fixed;inset:0;z-index:400;pointer-events:none;
   }
@@ -1840,6 +1996,12 @@ math-virtual-keyboard [part="keycap"] *,
 <canvas id="board"></canvas>
 <canvas id="preview"></canvas>
 
+<button class="wheel-lock" id="wheelLockBtn" aria-pressed="false" aria-label="滚轮平移：已锁定">
+  <svg class="wl-closed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+  <svg class="wl-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 7.7-1.7"/></svg>
+  <span class="wl-tip">滚轮平移</span>
+</button>
+
 <div id="widgetLayer"></div>
 
 <div class="sel-bar" id="selBar">
@@ -1967,7 +2129,10 @@ math-virtual-keyboard [part="keycap"] *,
 
 <div class="panel shape-panel" id="shapePanel">
   <div class="cat-strip" id="catStrip"></div>
-  <div class="shape-grid" id="shapeGrid"></div>
+  <div class="shape-grid-wrap">
+    <div class="shape-grid" id="shapeGrid"></div>
+    <div class="shape-cat-hint" id="shapeCatHint"></div>
+  </div>
 </div>
 
 <div class="panel pen-panel" id="penPanel">
@@ -2000,9 +2165,10 @@ math-virtual-keyboard [part="keycap"] *,
       <span>橡皮</span>
     </button>
     <div class="dock-sep"></div>
-    <button class="dbtn" id="shapeBtn" title="形状">
+    <button class="dbtn" id="shapeBtn" title="形状（面板打开时再点一次可锁定）">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="11" height="11" rx="2.5"/><rect x="10" y="10" width="11" height="11" rx="2.5"/></svg>
       <span>形状</span>
+      <i class="dbtn-lock"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></i>
     </button>
     <div class="dock-sep"></div>
     <button class="dbtn" id="undoBtn" title="撤销" disabled>
@@ -2156,6 +2322,13 @@ math-virtual-keyboard [part="keycap"] *,
             <span class="sub">MP4 / WebM，可剪切时长</span>
           </div>
         </div>
+        <!-- 找到这里，在视频下面加上这段 -->
+        <div class="export-opt" data-import="pdf">
+          <div>
+            <span>导入 PDF / PPT</span>
+            <span class="sub">PDF 或 PPTX，每页 / 每张作为页面背景</span>
+          </div>
+        </div>
         <div class="export-opt" data-import="file">
           <div>
             <span>加载工程文件</span>
@@ -2169,6 +2342,66 @@ math-virtual-keyboard [part="keycap"] *,
     </div>
   </div>
 </div>
+
+
+<!-- PDF 导入预览弹窗 -->
+<div class="modal" id="pdfImportModal">
+  <div class="modal-card pdf-import-card">
+    <div class="modal-head">
+      <span id="pdfModalTitle">导入 PDF / PPT</span>
+      <span class="pdf-file-name" id="pdfFileName"></span>
+    </div>
+    <div class="modal-body pdf-import-body">
+      <!-- 左侧预览区 -->
+      <div class="pdf-preview-pane">
+        <div class="pdf-preview-stage" id="pdfPreviewStage">
+          <canvas id="pdfPreviewCanvas"></canvas>
+          <div class="pdf-preview-loading" id="pdfPreviewLoading"><span></span>渲染中…</div>
+        </div>
+        <div class="pdf-preview-foot">
+          <button class="pdf-nav" id="pdfPrevPage" title="上一页">‹</button>
+          <span class="pdf-page-label" id="pdfPreviewPageLabel">第 1 页</span>
+          <button class="pdf-nav" id="pdfNextPage" title="下一页">›</button>
+        </div>
+      </div>
+      <!-- 右侧操作区 -->
+      <div class="pdf-side">
+        <div class="pblock">
+          <div class="plabel">预览页码</div>
+          <input type="number" id="pdfPageNum" class="gm-input" min="1" value="1" style="width: 100%; text-align: center;">
+          <div style="font-size:11px; color:#8fa3c0; text-align:center; margin-top:4px;">
+            共 <span id="pdfTotalPages">0</span> 页
+          </div>
+        </div>
+        <div class="pblock">
+          <div class="plabel">插入范围</div>
+          <div class="seg-row" id="pdfInsertMode">
+             <button class="seg-btn active" data-val="current">仅当前页</button>
+             <button class="seg-btn" data-val="all">全部页</button>
+          </div>
+          <div class="tip-line" style="margin-top:8px;">
+            每页 PDF / 幻灯片会变成白板的一页<b>背景</b>，宽度自动铺满白板；<br>
+            按住 <span class="kbd">鼠标中键</span> 拖动，或解锁右上角后用 <span class="kbd">滚轮</span> 上下平移，<span class="kbd">Ctrl</span>+滚轮缩放。
+          </div>
+        </div>
+        <div class="pblock">
+          <div class="plabel">输出宽度 <b id="pdfScaleVal">2400 px</b></div>
+          <input type="range" id="pdfScale" min="1600" max="3600" step="200" value="2400">
+          <div style="font-size:11px;color:#8fa3c0;line-height:1.55;margin-top:6px;">
+            数值越大放大越清晰，导入越慢、工程文件也越大。
+          </div>
+        </div>
+        <div style="flex: 1;"></div>
+        <button class="mbtn" id="pdfInsertBtn" style="width: 100%;">设为页面背景</button>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="mbtn ghost" id="pdfClearBg">清除当前页背景</button>
+      <button class="mbtn ghost" id="pdfCancel">取消</button>
+    </div>
+  </div>
+</div>
+
 
 <div class="modal" id="exportChooserModal">
   <div class="modal-card" style="max-width:430px;">
@@ -2325,7 +2558,7 @@ math-virtual-keyboard [part="keycap"] *,
       <p>· 点击「画笔」直接进入绘画，再次点击「画笔」才打开颜色 / 粗细 / 线型面板。</p>
       <p>· 橡皮为像素擦除：擦掉图形的一部分，移动 / 缩放后擦痕仍保留；触摸屏用力越大、接触面积越大，擦除范围越大；鼠标滚轮可调大小。</p>
       <p>· 双击「橡皮」显示滑动条，向右滑动到底清除本页所有图形；清空后会自动切回画笔。</p>
-      <p>· 点「形状」可切换类别并挑选图形，绘制完自动切回「选择」工具，需再点一次图形才会选中。</p>
+      <p>· 点「形状」可切换类别并挑选图形，绘制完自动切回「选择」工具，需再点一次图形才会选中；面板打开时再点一次「形状」可<b>锁定面板</b>，连续挑图形时不会自动关闭（再点一次退出）；在图形区域左右滑动（鼠标或手指）可快速切换类别。</p>
 
       <p style="margin-top:12px;"><b>导入与视频</b></p>
       <p>· 菜单 →「导入」：可插入图片、导入视频或加载 .json 工程文件。</p>
@@ -2375,6 +2608,7 @@ math-virtual-keyboard [part="keycap"] *,
       <p>· 右下角点击页码，可查看所有页缩略图并跳转。</p>
       <p>· 可上一页 / 下一页 / 新建页。</p>
       <p>· 图形列表和缩略图列表支持手指上下滑动浏览。</p>
+      <p>· <b>导入 PDF / PPT</b>：每一页 PDF 或每一张幻灯片会成为白板的一页<b>背景</b>，宽度默认铺满白板；按住 <span class="kbd">鼠标中键</span> 拖动页面，<span class="kbd">Ctrl</span>+滚轮缩放页面，按 <span class="kbd">0</span> 复位视图。右上角锁图标<b>锁定</b>时滚轮上下翻页，<b>解锁</b>后滚轮上下平移白板（<span class="kbd">Shift</span>+滚轮左右平移）。</p>
 
       <p style="margin-top:12px;"><b>导出</b></p>
       <p>· 菜单 →「导出」：可导出图片、导出视频或导出工程文件。</p>
@@ -2407,6 +2641,12 @@ math-virtual-keyboard [part="keycap"] *,
   <span class="kbd">Ctrl</span>+左键拖动 复制拖动 ·
   <span class="kbd">Ctrl</span>+<span class="kbd">Shift</span>+左键拖动 复制并锁定水平/竖直 ·
   <span class="kbd">Shift</span>+点击 加选/减选
+</p>
+<p>
+  <span class="kbd">鼠标中键</span> 拖动平移页面 ·
+  <span class="kbd">Ctrl</span>+滚轮 缩放页面 ·
+  <span class="kbd">0</span> 复位视图 ·
+  右上角锁图标：锁定滚轮翻页 / 解锁滚轮平移
 </p>
 
 <p style="margin-top:12px;color:#8fa3c0;font-size:12.5px;">
@@ -2689,6 +2929,15 @@ window.MathJax = {
 <script src="mathjax/tex-svg-full.js"></script>
 <link rel="stylesheet" href="jsxgraph/jsxgraph.css">
 <script src="jsxgraph/jsxgraphcore.js"></script>
+
+<!-- 引入本地离线的 PDF.js -->
+<script src="./lib/pdf.min.js"></script>
+<script src="./pptx.js"></script>
+<script>
+  // 配置 worker 路径（注意这里也要指向本地的文件）
+  pdfjsLib.GlobalWorkerOptions.workerSrc = './lib/pdf.worker.min.js';
+</script>
+
 <script src="license.js"></script>
 
 
