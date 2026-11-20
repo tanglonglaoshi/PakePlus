@@ -522,6 +522,11 @@ const state = {
   textUnderline: false
 };
 let cloneMode = false;
+let shapePanelLocked = false;   // 形状面板锁定：连续选图形不关闭
+let wheelPanUnlocked = false;   // 右上角滚轮平移锁（false = 锁定：滚轮翻页）
+let wheelPageAcc = 0;           // 滚轮翻页累加
+let wheelPageCool = 0;          // 翻页冷却
+let wheelPageToastAt = 0;       // 首/末页提示节流
 let internalClipboard = [];
 let pasteCount = 0;
 
@@ -614,6 +619,7 @@ function applyGesture() {
 }
 
 let pages = [[]];
+let pageBgs = [null];          // ★ 每页背景（PDF 页面图），与 pages 一一对应
 let pageIndex = 0;
 let objects = pages[0];
 
@@ -1640,6 +1646,7 @@ function render() {
   ctx.translate(view.offsetX, view.offsetY);
   ctx.scale(view.scale, view.scale);
   drawGrid();
+  drawCurrentPageBg(ctx);        // ★ PDF 页面背景：在网格之上、图形之下
   const w0 = screenToWorld(0, 0);
   const w1 = screenToWorld(W, H);
   const pad = 60;
@@ -2309,7 +2316,7 @@ function updatePlayButtons() {
 const MAX_SNAPSHOTS = 30;
 function pushSnapshot() {
   snapshots = snapshots.slice(0, snapIndex + 1);
-  snapshots.push({ pages: pages.map(pg => pg.map(copyObj)), pageIndex });
+  snapshots.push({ pages: pages.map(pg => pg.map(copyObj)), pageBgs: pageBgs.slice(), pageIndex });
   snapIndex = snapshots.length - 1;
   if (snapshots.length > MAX_SNAPSHOTS) { snapshots.shift(); snapIndex--; }
   updateHistoryButtons();
@@ -2323,6 +2330,8 @@ function restoreSnapshot(s) {
     if (o._origImg) t._origImg = o._origImg;
     return t;
   }));
+  if (Array.isArray(s.pageBgs)) pageBgs = s.pageBgs.slice();
+  normalizePageBgs();
   pageIndex = Math.min(s.pageIndex, pages.length - 1);
   objects = pages[pageIndex];
   selection = [];
@@ -2339,6 +2348,7 @@ function updateHistoryButtons() {
  * 13. 页面
  * ===================================================================== */
 function updatePageUI() {
+  normalizePageBgs();
   pgLabel.textContent = (pageIndex + 1) + ' / ' + pages.length;
   document.getElementById('prevPage').disabled = pageIndex <= 0;
   document.getElementById('nextPage').disabled = pageIndex >= pages.length - 1;
@@ -2358,6 +2368,7 @@ function goPage(n) {
 }
 function addPage() {
   pages.push([]);
+  pageBgs.push(null);
   pageIndex = pages.length - 1;
   objects = pages[pageIndex];
   selection = [];
@@ -2369,8 +2380,9 @@ function deletePage(idx) {
   if (typeof idx !== 'number' || idx < 0 || idx >= pages.length) return;
 
   if (pages.length <= 1) {
-    if (!pages[0].length) { toast('已经是空白页了'); return; }
+    if (!pages[0].length && !pageBgs[0]) { toast('已经是空白页了'); return; }
     pages[0].length = 0;
+    pageBgs[0] = null;
     objects = pages[0];
     selection = [];
     pushSnapshot();
@@ -2382,6 +2394,7 @@ function deletePage(idx) {
 
   const no = idx + 1;
   pages.splice(idx, 1);
+  pageBgs.splice(idx, 1);
   if (pageIndex >= pages.length) pageIndex = pages.length - 1;
   else if (idx < pageIndex) pageIndex--;
 
@@ -2432,6 +2445,20 @@ function isShapeTool(t) {
   return t !== 'select' && t !== 'pen' && t !== 'eraser' &&
          !!PB.shapes[t] && !PB.shapes[t].hidden;
 }
+/* ===== 形状面板锁定 ===== */
+function syncShapeLockUI() {
+  const btn = document.getElementById('shapeBtn');
+  if (!btn) return;
+  const locked = shapePanelLocked && shapePanel.classList.contains('show');
+  btn.classList.toggle('locked', locked);
+  btn.classList.toggle('active', locked || isShapeTool(state.tool));
+  shapePanel.classList.toggle('locked', locked);
+}
+function closeShapePanelLock() {
+  shapePanelLocked = false;
+  shapePanel.classList.remove('show');
+  syncShapeLockUI();
+}
 function setTool(t, noAutoPanel) {
   if (textEditorEl && t !== state.tool) commitTextEditor();
   state.tool = t;
@@ -2442,11 +2469,16 @@ function setTool(t, noAutoPanel) {
   document.getElementById('shapeBtn').classList.toggle('active', isShape);
   if (noAutoPanel) {
     penPanel.classList.remove('show');
-    if (!isShape) shapePanel.classList.remove('show');
+    if (!isShape) {
+      /* 锁定面板时，画完图形自动切到“选择”也保持面板打开 */
+      if (shapePanelLocked) shapePanel.classList.add('show');
+      else shapePanel.classList.remove('show');
+    }
   } else {
     penPanel.classList.toggle('show', t === 'pen');
     shapePanel.classList.toggle('show', isShape);
   }
+  syncShapeLockUI();
   if (isShape) {
     const def = PB.shapes[t];
     if (def && def.cat) state.shapeCat = def.cat;
@@ -2530,7 +2562,7 @@ function buildShapePanel() {
     b.innerHTML = renderShapeIcon(s.icon) + '<span>' + escapeHtml(s.label || k) + '</span>';
     b.addEventListener('click', () => {
       setTool(k);
-      shapePanel.classList.remove('show');
+      if (!shapePanelLocked) shapePanel.classList.remove('show');
     });
     frag.appendChild(b);
   }
@@ -2540,6 +2572,17 @@ function buildShapePanel() {
     d.textContent = '该类别下暂无图形';
     shapeGrid.appendChild(d);
   } else shapeGrid.appendChild(frag);
+
+  requestAnimationFrame(() => {
+    const chip = catStrip.querySelector('.cat-chip.active');
+    if (!chip) return;
+    const cr = catStrip.getBoundingClientRect();
+    const ar = chip.getBoundingClientRect();
+    if (ar.left < cr.left + 4 || ar.right > cr.right - 4) {
+      const target = catStrip.scrollLeft + (ar.left - cr.left) - (cr.width - ar.width) / 2;
+      try { catStrip.scrollTo({ left: Math.max(0, target), behavior: 'smooth' }); } catch (e) {}
+    }
+  });
 }
 function attachCatDrag() {
   if (catStrip._dragAttached) return;
@@ -2618,6 +2661,105 @@ function switchCategory(dir) {
     state.shapeCat = cats[next].id;
     buildShapePanel();
   }
+}
+
+/* ===== 形状网格：左右滑动切换类别 ===== */
+function shapeCategoryTargets(dir) {
+  const cats = getCategories().filter(c => catHasShapes(c.id));
+  let idx = cats.findIndex(c => c.id === state.shapeCat);
+  if (idx < 0) idx = 0;
+  return cats[idx + dir] || null;
+}
+
+function animateShapeCategory(dir) {
+  if (shapeGrid._switching) return false;
+  if (!shapeCategoryTargets(dir)) return false;
+  shapeGrid._switching = true;
+  shapeGrid.style.transform = '';
+  shapeGrid.classList.remove('cat-enter-left', 'cat-enter-right');
+  shapeGrid.classList.add(dir > 0 ? 'cat-leave-left' : 'cat-leave-right');
+  setTimeout(() => {
+    switchCategory(dir);
+    shapeGrid.classList.remove('cat-leave-left', 'cat-leave-right');
+    shapeGrid.classList.add(dir > 0 ? 'cat-enter-right' : 'cat-enter-left');
+    void shapeGrid.offsetWidth;
+    shapeGrid.classList.remove('cat-enter-right', 'cat-enter-left');
+    setTimeout(() => { shapeGrid._switching = false; }, 220);
+  }, 150);
+  return true;
+}
+
+function attachShapeGridSwipe() {
+  if (shapeGrid._swipeBound) return;
+  shapeGrid._swipeBound = true;
+
+  let pid = null, sx = 0, sy = 0, dx = 0, mode = 0, moved = false;
+  const hint = document.getElementById('shapeCatHint');
+
+  function showHint(text) {
+    if (!hint) return;
+    hint.textContent = text;
+    hint.classList.add('show');
+  }
+  function hideHint() {
+    if (hint) hint.classList.remove('show');
+  }
+
+  shapeGrid.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (shapeGrid._switching) return;
+    pid = e.pointerId; sx = e.clientX; sy = e.clientY;
+    dx = 0; mode = 0; moved = false;
+  });
+
+  shapeGrid.addEventListener('pointermove', e => {
+    if (pid !== e.pointerId) return;
+    const mx = e.clientX - sx, my = e.clientY - sy;
+    if (mode === 0) {
+      if (Math.abs(mx) > 10 && Math.abs(mx) > Math.abs(my) + 4) {
+        mode = 2;
+        shapeGrid.classList.add('swiping');
+        try { shapeGrid.setPointerCapture(e.pointerId); } catch (err) {}
+      } else if (Math.abs(my) > 10) {
+        mode = 1;
+        return;
+      } else {
+        return;
+      }
+    }
+    if (mode !== 2) return;
+    moved = true;
+    dx = mx;
+    shapeGrid.style.transform = 'translateX(' + (dx * 0.32) + 'px)';
+    if (e.cancelable) e.preventDefault();
+    const dir = dx < 0 ? 1 : -1;
+    const target = shapeCategoryTargets(dir);
+    showHint((dir > 0 ? '\u203a' : '\u2039') + ' ' + (target ? target.label : '没有更多类别'));
+  }, { passive: false });
+
+  const finish = e => {
+    if (pid !== e.pointerId) return;
+    pid = null;
+    const wasSwipe = mode === 2;
+    mode = 0;
+    if (!wasSwipe) return;
+    shapeGrid.classList.remove('swiping');
+    hideHint();
+    const dir = dx < 0 ? 1 : -1;
+    if (Math.abs(dx) > 56) {
+      animateShapeCategory(dir);
+    } else {
+      shapeGrid.style.transform = '';
+    }
+    if (moved) {
+      const stop = ev => { ev.stopPropagation(); ev.preventDefault(); };
+      shapeGrid.addEventListener('click', stop, { capture: true, once: true });
+      setTimeout(() => shapeGrid.removeEventListener('click', stop, true), 80);
+    }
+    dx = 0;
+  };
+  shapeGrid.addEventListener('pointerup', finish);
+  shapeGrid.addEventListener('pointercancel', finish);
 }
 
 function makeTouchScrollable(el) {
@@ -7419,7 +7561,7 @@ function onPointerUp(e) {
     const wasShape = isShapeTool(state.tool);
     current = null;
     render(); drawPreview();
-    if (wasShape) setTool('select');
+    if (wasShape) setTool('select', true);
   } else {
     current = null;
     render(); drawPreview();
@@ -7785,6 +7927,8 @@ window.addEventListener('keydown', e => {
     if (eraseSliderEl) { eraseSliderEl.remove(); eraseSliderEl = null; return; }
     if (selection.length) { selection = []; updateSelBar(); drawPreview(); }
     hideMenu(); hideSubPanels(); thumbPanel.classList.remove('show');
+    document.body.classList.remove('thumbs-open');
+    closeShapePanelLock();
     return;
   }
   if (textEditorEl) return;
@@ -7866,6 +8010,33 @@ window.addEventListener('keydown', e => {
     render(); drawPreview(); updateSelBarPosition();
   }
 });
+/* ===== 右上角滚轮平移锁 ===== */
+function syncWheelLockUI() {
+  const btn = document.getElementById('wheelLockBtn');
+  if (!btn) return;
+  btn.classList.toggle('unlocked', wheelPanUnlocked);
+  btn.setAttribute('aria-pressed', wheelPanUnlocked ? 'true' : 'false');
+  btn.setAttribute('aria-label', wheelPanUnlocked
+    ? '滚轮平移：已解锁（点击锁定后滚轮翻页）'
+    : '滚轮翻页：已锁定（点击解锁后滚轮平移）');
+  const tip = btn.querySelector('.wl-tip');
+  if (tip) tip.textContent = wheelPanUnlocked ? '滚轮平移' : '滚轮翻页';
+}
+(function initWheelLock() {
+  try { wheelPanUnlocked = localStorage.getItem('pb_wheel_pan') === '1'; } catch (e) {}
+  syncWheelLockUI();
+  const btn = document.getElementById('wheelLockBtn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    wheelPanUnlocked = !wheelPanUnlocked;
+    try { localStorage.setItem('pb_wheel_pan', wheelPanUnlocked ? '1' : '0'); } catch (e) {}
+    syncWheelLockUI();
+    toast(wheelPanUnlocked
+      ? '滚轮已解锁：滚轮上下移动白板（Shift+滚轮左右移动）'
+      : '滚轮已锁定：滚轮上下翻页（中键仍可拖动，Ctrl+滚轮缩放）', 3200);
+  });
+})();
+
 window.addEventListener('wheel', e => {
   if (e.ctrlKey || e.metaKey) {
     if (e.target.tagName !== 'CANVAS') return;
@@ -7874,6 +8045,47 @@ window.addEventListener('wheel', e => {
     render(); drawPreview();
     if (selBar.classList.contains('show')) updateSelBarPosition();
     if (typeof positionTextEditor === 'function') positionTextEditor();
+    return;
+  }
+
+  /* ★ 滚轮平移：右上角解锁后，非橡皮擦状态下滚轮移动白板 */
+  if (wheelPanUnlocked && state.tool !== 'eraser' && e.target.tagName === 'CANVAS' &&
+      !document.querySelector('.modal.show')) {
+    e.preventDefault();
+    const unit = e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? W : 1);
+    view.offsetX -= (e.deltaX || 0) * unit;
+    view.offsetY -= (e.deltaY || 0) * unit;
+    render(); drawPreview();
+    if (selBar.classList.contains('show')) updateSelBarPosition();
+    if (typeof positionTextEditor === 'function') positionTextEditor();
+    return;
+  }
+
+  /* ★ 锁定状态：滚轮翻页（橡皮擦下仍保留原滚轮调大小） */
+  if (!wheelPanUnlocked && state.tool !== 'eraser' && e.target.tagName === 'CANVAS' &&
+      !document.querySelector('.modal.show') && !textEditorEl) {
+    e.preventDefault();
+    const now = Date.now();
+    if (now < wheelPageCool) return;
+    const unit = e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? H : 1);
+    wheelPageAcc += e.deltaY * unit;
+    if (Math.abs(wheelPageAcc) < 50) return;
+    const dir = wheelPageAcc > 0 ? 1 : -1;
+    wheelPageAcc = 0;
+    wheelPageCool = now + 260;
+    if (dir > 0) {
+      if (pageIndex < pages.length - 1) goPage(pageIndex + 1);
+      else if (now > wheelPageToastAt) {
+        wheelPageToastAt = now + 1500;
+        toast('已经是最后一页', 1400);
+      }
+    } else {
+      if (pageIndex > 0) goPage(pageIndex - 1);
+      else if (now > wheelPageToastAt) {
+        wheelPageToastAt = now + 1500;
+        toast('已经是第一页', 1400);
+      }
+    }
     return;
   }
 
@@ -8005,6 +8217,7 @@ document.getElementById('importModal').addEventListener('click', e => {
   const kind = opt.dataset.import;
   if (kind === 'image') openImagePicker();
   else if (kind === 'video') openVideoPicker();
+else if (kind === 'pdf') openPdfPicker(); // 👈 就是加上这一行
   else if (kind === 'file') loadDocFile();
 });
 document.getElementById('importCancel').addEventListener('click', () => closeModal('importModal'));
@@ -8304,6 +8517,415 @@ function openImagePicker() {
   inp.click();
 }
 
+
+/* =====================================================================
+ * PDF 导入功能
+ * ===================================================================== */
+/* =====================================================================
+ * PDF 页面背景（白板每页最底层的一张“纸”）
+ * ===================================================================== */
+let pageBgHintEl = null;
+let pageBgHintTimer = null;
+
+/* pages / pageBgs 是两条平行数组，这里保证长度一致 */
+function normalizePageBgs() {
+  if (!Array.isArray(pageBgs)) pageBgs = [];
+  while (pageBgs.length < pages.length) pageBgs.push(null);
+  if (pageBgs.length > pages.length) pageBgs.length = pages.length;
+}
+
+/* 新建一页背景：宽度铺满白板（世界坐标宽度 = 白板宽度） */
+function makePageBg(dataUrl, natW, natH, worldW) {
+  const w = (typeof worldW === 'number' && worldW > 1) ? worldW : (W > 1 ? W : 1600);
+  const sw = (typeof natW === 'number' && natW > 0) ? natW : w;
+  const sh = (typeof natH === 'number' && natH > 0) ? natH : w * 1.4142;
+  const bg = {
+    src: dataUrl,
+    img: null,
+    natW: sw,
+    natH: sh,
+    x: 0,
+    y: 0,
+    w: w,
+    h: w * (sh / sw),
+    _ready: null
+  };
+  bg._ready = new Promise(resolve => {
+    const im = new Image();
+    im.onload = () => { bg.img = im; resolve(bg); };
+    im.onerror = () => resolve(bg);
+    im.src = dataUrl;
+  });
+  return bg;
+}
+
+/* 从工程文件里的记录恢复背景（保留保存时的位置与尺寸） */
+function makePageBgFromRecord(rec) {
+  const bg = makePageBg(rec.src, rec.natW, rec.natH, rec.w);
+  if (typeof rec.x === 'number') bg.x = rec.x;
+  if (typeof rec.y === 'number') bg.y = rec.y;
+  if (typeof rec.w === 'number' && rec.w > 0) bg.w = rec.w;
+  if (typeof rec.h === 'number' && rec.h > 0) bg.h = rec.h;
+  return bg;
+}
+
+/* 在世界坐标系里画背景（屏幕渲染与导出共用） */
+function drawPageBg(c, bg) {
+  if (!bg || !bg.img) return;
+  c.save();
+  c.imageSmoothingEnabled = true;
+  if ('imageSmoothingQuality' in c) c.imageSmoothingQuality = 'high';
+  c.drawImage(bg.img, bg.x, bg.y, bg.w, bg.h);
+  c.strokeStyle = 'rgba(120,180,255,.18)';
+  c.lineWidth = 1 / Math.max(0.05, view.scale);
+  c.strokeRect(bg.x, bg.y, bg.w, bg.h);
+  c.restore();
+}
+
+function drawCurrentPageBg(c) {
+  drawPageBg(c, pageBgs && pageBgs[pageIndex]);
+}
+
+/* 导入后的操作提示：中键拖动页面 / Ctrl+滚轮缩放页面 */
+function showPageBgHint() {
+  if (pageBgHintEl) { pageBgHintEl.remove(); pageBgHintEl = null; }
+  clearTimeout(pageBgHintTimer);
+  const el = document.createElement('div');
+  el.id = '__pageBgHint';
+  el.innerHTML =
+    '<b>PDF / 幻灯片已放入页面背景</b>' +
+    '<span><span class="kbd">中键</span>拖动 · 右上角锁定：滚轮翻页 / 解锁：滚轮平移 · <span class="kbd">Ctrl</span>+滚轮缩放</span>' +
+    '<button type="button" title="关闭">×</button>';
+  document.body.appendChild(el);
+  pageBgHintEl = el;
+  el.querySelector('button').addEventListener('click', () => {
+    el.remove();
+    if (pageBgHintEl === el) pageBgHintEl = null;
+  });
+  pageBgHintTimer = setTimeout(() => {
+    if (!pageBgHintEl) return;
+    pageBgHintEl.classList.add('hide');
+    setTimeout(() => {
+      if (pageBgHintEl) { pageBgHintEl.remove(); pageBgHintEl = null; }
+    }, 400);
+  }, 9000);
+}
+
+let currentPdf = null;
+let currentPdfPage = 1;
+let currentPdfName = '';
+let currentDeck = null;          // PPTX 幻灯片渲染器
+
+function importTotalPages() {
+  if (currentDeck) return currentDeck.slideCount();
+  if (currentPdf) return currentPdf.numPages;
+  return 0;
+}
+function releaseDeck() {
+  if (!currentDeck) return;
+  try { if (typeof currentDeck.dispose === 'function') currentDeck.dispose(); } catch (e) {}
+  currentDeck = null;
+}
+
+function openPdfPicker() {
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = '.pdf,.pptx,.ppt,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation';
+  inp.style.display = 'none';
+  document.body.appendChild(inp);
+  inp.onchange = async () => {
+    const f = inp.files && inp.files[0];
+    setTimeout(() => inp.remove(), 0);
+    if (!f) return;
+    try {
+      if (/\.pptx$/i.test(f.name)) await loadPptx(f);
+      else if (/\.ppt$/i.test(f.name)) {
+        toast('旧版 .ppt 需要先在 PowerPoint 里「另存为 .pptx」再导入', 4600);
+        return;
+      } else await loadPdf(f);
+    } catch (e) { return; }
+    openModal('pdfImportModal');
+    requestAnimationFrame(() => fitPdfPreviewCanvas());
+  };
+  inp.click();
+}
+
+async function loadPptx(file) {
+  if (typeof window.PPTX === 'undefined') throw new Error('PPT 解析模块未加载（pptx.js）');
+  const arrayBuffer = await file.arrayBuffer();
+  let deck;
+  try {
+    deck = await PPTX.load(arrayBuffer);
+  } catch (e) {
+    console.error(e);
+    toast('PPT 解析失败：' + (e && e.message ? e.message : e), 4800);
+    throw e;
+  }
+  releaseDeck();
+  currentDeck = deck;
+  currentPdf = null;
+  currentPdfPage = 1;
+  currentPdfName = file.name || '';
+  const nameEl = document.getElementById('pdfFileName');
+  if (nameEl) nameEl.textContent = currentPdfName;
+  const titleEl = document.getElementById('pdfModalTitle');
+  if (titleEl) titleEl.textContent = '导入 PPT';
+  const total = deck.slideCount();
+  document.getElementById('pdfTotalPages').textContent = total;
+  const pageNumInput = document.getElementById('pdfPageNum');
+  pageNumInput.max = total;
+  pageNumInput.value = 1;
+  pageNumInput.oninput = () => {
+    let val = parseInt(pageNumInput.value) || 1;
+    if (val < 1) val = 1;
+    if (val > total) val = total;
+    currentPdfPage = val;
+    renderPdfPreview();
+  };
+  renderPdfPreview();
+}
+
+async function loadPdf(file) {
+  const arrayBuffer = await file.arrayBuffer();
+  try {
+    releaseDeck();
+    currentPdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    currentPdfPage = 1;
+    currentPdfName = file.name || '';
+    const pdfNameEl = document.getElementById('pdfFileName');
+    if (pdfNameEl) pdfNameEl.textContent = currentPdfName;
+    const pdfTitleEl = document.getElementById('pdfModalTitle');
+    if (pdfTitleEl) pdfTitleEl.textContent = '导入 PDF';
+    
+    document.getElementById('pdfTotalPages').textContent = currentPdf.numPages;
+    const pageNumInput = document.getElementById('pdfPageNum');
+    pageNumInput.max = currentPdf.numPages;
+    pageNumInput.value = 1;
+    
+    pageNumInput.oninput = () => {
+      let val = parseInt(pageNumInput.value) || 1;
+      if (val < 1) val = 1;
+      if (val > currentPdf.numPages) val = currentPdf.numPages;
+      currentPdfPage = val;
+      renderPdfPreview();
+    };
+    
+    renderPdfPreview();
+  } catch (e) {
+    toast('PDF 加载失败：文件可能已损坏或被加密');
+  }
+}
+
+let pdfPreviewSeq = 0;
+
+/* 让预览图按容器尺寸等比缩放，绝不超出预览框 */
+function fitPdfPreviewCanvas() {
+  const cv = document.getElementById('pdfPreviewCanvas');
+  const stage = document.getElementById('pdfPreviewStage');
+  if (!cv || !stage) return;
+  const aw = stage.clientWidth - 8;
+  const ah = stage.clientHeight - 8;
+  if (aw < 40 || ah < 40 || !cv.width || !cv.height) return;
+  const k = Math.min(aw / cv.width, ah / cv.height);
+  cv.style.width = Math.max(1, Math.round(cv.width * k)) + 'px';
+  cv.style.height = Math.max(1, Math.round(cv.height * k)) + 'px';
+}
+
+async function renderPdfPreview() {
+  if (!currentPdf && !currentDeck) return;
+  const seq = ++pdfPreviewSeq;
+  const canvas = document.getElementById('pdfPreviewCanvas');
+  const loading = document.getElementById('pdfPreviewLoading');
+  const label = document.getElementById('pdfPreviewPageLabel');
+  const prevBtn = document.getElementById('pdfPrevPage');
+  const nextBtn = document.getElementById('pdfNextPage');
+  const total = importTotalPages();
+  if (label) label.textContent = '第 ' + currentPdfPage + ' 页';
+  if (prevBtn) prevBtn.disabled = currentPdfPage <= 1;
+  if (nextBtn) nextBtn.disabled = currentPdfPage >= total;
+  if (loading) loading.classList.add('show');
+  try {
+    const ctx = canvas.getContext('2d');
+    if (currentDeck) {
+      const sc = await currentDeck.renderSlideCanvas(currentPdfPage - 1, 1400);
+      if (seq !== pdfPreviewSeq) return;
+      canvas.width = sc.width;
+      canvas.height = sc.height;
+      ctx.drawImage(sc, 0, 0);
+    } else {
+      const page = await currentPdf.getPage(currentPdfPage);
+      if (seq !== pdfPreviewSeq) return;
+      const viewport = page.getViewport({ scale: 2 });
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+    }
+    if (seq !== pdfPreviewSeq) return;
+    fitPdfPreviewCanvas();
+  } catch (e) {
+    console.error(e);
+  } finally {
+    if (seq === pdfPreviewSeq && loading) loading.classList.remove('show');
+  }
+}
+
+// 绑定弹窗上的交互事件
+document.getElementById('pdfCancel').addEventListener('click', () => {
+  releaseDeck();
+  closeModal('pdfImportModal');
+});
+document.getElementById('pdfPrevPage').addEventListener('click', () => {
+  if ((!currentPdf && !currentDeck) || currentPdfPage <= 1) return;
+  currentPdfPage--;
+  document.getElementById('pdfPageNum').value = currentPdfPage;
+  renderPdfPreview();
+});
+document.getElementById('pdfNextPage').addEventListener('click', () => {
+  if (!currentPdf && !currentDeck) return;
+  if (currentPdfPage >= importTotalPages()) return;
+  currentPdfPage++;
+  document.getElementById('pdfPageNum').value = currentPdfPage;
+  renderPdfPreview();
+});
+window.addEventListener('resize', () => {
+  const m = document.getElementById('pdfImportModal');
+  if (m && m.classList.contains('show')) fitPdfPreviewCanvas();
+});
+document.getElementById('pdfScale').addEventListener('input', (e) => {
+  document.getElementById('pdfScaleVal').textContent = Math.round(parseFloat(e.target.value)) + ' px';
+});
+
+document.getElementById('pdfInsertBtn').addEventListener('click', async () => {
+  if (!currentPdf && !currentDeck) return;
+
+  const modeEl = document.querySelector('#pdfInsertMode .seg-btn.active');
+  const mode = modeEl ? modeEl.dataset.val : 'current';
+  const targetW = parseInt(document.getElementById('pdfScale').value, 10) || 2400;
+  const btn = document.getElementById('pdfInsertBtn');
+  const oldText = btn.textContent;
+
+  const list = [];
+  const totalPages = importTotalPages();
+  if (mode === 'current') {
+    list.push(currentPdfPage);
+  } else {
+    for (let i = 1; i <= totalPages; i++) list.push(i);
+  }
+
+  btn.disabled = true;
+  btn.textContent = '准备中…';
+
+  const bgs = [];
+  /* 背景宽度 = 白板宽度：100% 缩放时正好铺满一屏 */
+  const boardW = W > 1 ? W : 1600;
+
+  try {
+    for (let k = 0; k < list.length; k++) {
+      btn.textContent = '处理中… ' + (k + 1) + ' / ' + list.length;
+
+      let dataUrl = '', natW = 1, natH = 1;
+      if (currentDeck) {
+        /* PPTX：直接用渲染器把这张幻灯片画到目标宽度 */
+        const sc = await currentDeck.renderSlideCanvas(list[k] - 1, targetW);
+        dataUrl = sc.toDataURL('image/png');
+        natW = sc.width; natH = sc.height;
+        sc.width = 0; sc.height = 0;
+      } else {
+        const pdfPage = await currentPdf.getPage(list[k]);
+        const base = pdfPage.getViewport({ scale: 1 });
+
+        /* 用「输出像素宽度」反算渲染倍率：不再被 640px 上限压缩，放大不糊 */
+        let renderScale = targetW / base.width;
+        const MAX_PX = 24 * 1000 * 1000;          // 单页最多 2400 万像素，防止内存爆掉
+        const totalPx = base.width * base.height * renderScale * renderScale;
+        if (totalPx > MAX_PX) renderScale *= Math.sqrt(MAX_PX / totalPx);
+
+        const viewport = pdfPage.getViewport({ scale: renderScale });
+        const cv = document.createElement('canvas');
+        cv.width = Math.max(1, Math.round(viewport.width));
+        cv.height = Math.max(1, Math.round(viewport.height));
+        const cx = cv.getContext('2d');
+        cx.fillStyle = '#ffffff';                 // PDF 透明底 → 白纸
+        cx.fillRect(0, 0, cv.width, cv.height);
+        await pdfPage.render({ canvasContext: cx, viewport: viewport }).promise;
+
+        dataUrl = cv.toDataURL('image/png');
+        cv.width = 0; cv.height = 0;              // 及时释放大画布
+        natW = base.width; natH = base.height;
+      }
+
+      bgs.push(makePageBg(dataUrl, natW, natH, boardW));
+    }
+
+    await Promise.all(bgs.map(b => b._ready));
+
+    selection = [];
+    if (mode === 'current') {
+      pageBgs[pageIndex] = bgs[0];
+      objects = pages[pageIndex];
+    } else if (!pages[pageIndex].length && !pageBgs[pageIndex]) {
+      /* 当前页是空白页：直接用它承载第一页，避免前面多出一张空白页 */
+      pageBgs[pageIndex] = bgs[0];
+      objects = pages[pageIndex];
+      pages.splice(pageIndex + 1, 0, ...bgs.slice(1).map(() => []));
+      pageBgs.splice(pageIndex + 1, 0, ...bgs.slice(1));
+    } else {
+      const insertAt = pageIndex + 1;
+      pages.splice(insertAt, 0, ...bgs.map(() => []));
+      pageBgs.splice(insertAt, 0, ...bgs);
+      pageIndex = insertAt;
+      objects = pages[pageIndex];
+    }
+
+    normalizePageBgs();
+    /* 背景按 100% 缩放铺满白板，这里把视图归位 */
+    view.scale = 1;
+    view.offsetX = 0;
+    view.offsetY = 0;
+
+    setTool('select', true);
+    pushSnapshot();
+    updateSelBar();
+    updatePageUI();
+    render(); drawPreview();
+    if (thumbPanel.classList.contains('show')) buildThumbnails();
+
+    releaseDeck();
+    closeModal('pdfImportModal');
+    toast('已把 ' + bgs.length + ' 页 PDF / 幻灯片设为页面背景（宽度已铺满白板）', 3600);
+    showPageBgHint();
+  } catch (e) {
+    console.error(e);
+    toast('页面渲染失败：' + (e && e.message ? e.message : e), 4200);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+});
+
+/* 弹窗关闭时释放 PPT 解析结果（图片解码内存较大） */
+(function watchPdfModal() {
+  const m = document.getElementById('pdfImportModal');
+  if (!m || typeof MutationObserver === 'undefined') return;
+  new MutationObserver(() => {
+    if (!m.classList.contains('show')) releaseDeck();
+  }).observe(m, { attributes: true, attributeFilter: ['class'] });
+})();
+
+/* 清除当前页背景（PDF 导入弹窗里的按钮） */
+const pdfClearBgBtn = document.getElementById('pdfClearBg');
+if (pdfClearBgBtn) pdfClearBgBtn.addEventListener('click', () => {
+  if (!pageBgs[pageIndex]) { toast('当前页没有背景'); return; }
+  pageBgs[pageIndex] = null;
+  pushSnapshot();
+  render(); drawPreview();
+  if (thumbPanel.classList.contains('show')) buildThumbnails();
+  closeModal('pdfImportModal');
+  toast('已清除第 ' + (pageIndex + 1) + ' 页的背景（Ctrl+Z 可撤销）');
+});
+
+
+
 /* ---- 视频插入 ---- */
 function createVideoObject(blobUrl, worldCenter, naturalW, naturalH, duration) {
   const MAX = 640;
@@ -8469,13 +9091,16 @@ function parsePageRange(txt, total) {
   return [...res].sort((x, y) => x - y);
 }
 
-function makeExportCanvas(pageObjs) {
+function makeExportCanvas(pageObjs, pageBg) {
   let wx1, wy1, ww, wh;
-  if (!pageObjs.length) {
+  const bgRect = (pageBg && pageBg.w > 0)
+    ? [{ x1: pageBg.x, y1: pageBg.y, x2: pageBg.x + pageBg.w, y2: pageBg.y + pageBg.h }]
+    : [];
+  if (!pageObjs.length && !bgRect.length) {
     const w0 = screenToWorld(0, 0), w1 = screenToWorld(W, H);
     wx1 = w0.x; wy1 = w0.y; ww = w1.x - w0.x; wh = w1.y - w0.y;
   } else {
-    const bb = unionBBox(pageObjs);
+    const bb = unionBBox(pageObjs.concat(bgRect));
     const pad = 40;
     wx1 = bb.x1 - pad; wy1 = bb.y1 - pad;
     ww = Math.max(1, bb.x2 - bb.x1 + pad * 2);
@@ -8496,6 +9121,15 @@ paintBackgroundToCanvas(tc, tmp.width, tmp.height);
   const s = dpr * scale;
   tc.setTransform(s, 0, 0, s, -wx1 * s, -wy1 * s);
 
+  /* ★ 导出图里也带上页面背景 */
+  if (pageBg && pageBg.img) {
+    tc.save();
+    tc.imageSmoothingEnabled = true;
+    if ('imageSmoothingQuality' in tc) tc.imageSmoothingQuality = 'high';
+    tc.drawImage(pageBg.img, pageBg.x, pageBg.y, pageBg.w, pageBg.h);
+    tc.restore();
+  }
+
   const saved = objects;
   objects = pageObjs;
   try {
@@ -8507,7 +9141,7 @@ paintBackgroundToCanvas(tc, tmp.width, tmp.height);
 }
 async function exportPageImage(idx) {
 await preloadBgImage();   
-  const tmp = makeExportCanvas(pages[idx]);
+  const tmp = makeExportCanvas(pages[idx], pageBgs[idx]);
   const filename = '白板_第' + (idx + 1) + '页_' +
                    new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.png';
   const blob = dataURLToBlob(tmp.toDataURL('image/png'));
@@ -8520,7 +9154,7 @@ await preloadBgImage();          // ← 新增
   let lastLoc = '';
   let n = 0;
   for (let i = 0; i < pages.length; i++) {
-    const tmp = makeExportCanvas(pages[i]);
+    const tmp = makeExportCanvas(pages[i], pageBgs[i]);
     const filename = '白板_第' + (i + 1) + '页_' + ts + '.png';
     const blob = dataURLToBlob(tmp.toDataURL('image/png'));
     const r = await saveImageBlob(blob, filename);
@@ -8538,7 +9172,7 @@ async function exportPagesList(list) {
   let n = 0;
   for (let k = 0; k < list.length; k++) {
     const idx = list[k];
-    const tmp = makeExportCanvas(pages[idx]);
+    const tmp = makeExportCanvas(pages[idx], pageBgs[idx]);
     const filename = '白板_第' + (idx + 1) + '页_' + ts + '.png';
     const blob = dataURLToBlob(tmp.toDataURL('image/png'));
     const r = await saveImageBlob(blob, filename);
@@ -8571,12 +9205,17 @@ function pickVideoMime() {
 }
 function extFromMime(t) { return /mp4/i.test(t || '') ? 'mp4' : 'webm'; }
 
-function paintVideoFrame(c2, cv, objs) {
+function paintVideoFrame(c2, cv, objs, bg) {
   c2.setTransform(1, 0, 0, 1, 0, 0);
   paintBackgroundToCanvas(c2, cv.width, cv.height);
 
   const s = cv.width / W;
   c2.setTransform(s, 0, 0, s, 0, 0);
+  if (bg && bg.img) {
+    c2.imageSmoothingEnabled = true;
+    if ('imageSmoothingQuality' in c2) c2.imageSmoothingQuality = 'high';
+    c2.drawImage(bg.img, bg.x, bg.y, bg.w, bg.h);
+  }
   for (const o of objs) {
     try { drawObject(c2, o); } catch (e) {}
   }
@@ -8638,7 +9277,7 @@ await preloadBgImage();          // ← 新增：确保背景图已加载
   objects = pageObjs;
   dpr = baseScale;
 
-  paintVideoFrame(c2, cv, pageObjs);
+  paintVideoFrame(c2, cv, pageObjs, pageBgs[pageIdx] || null);
 
   rec.start(250);
   videoRec = rec;
@@ -8655,7 +9294,7 @@ await preloadBgImage();          // ← 新增：确保背景图已加载
       if (el >= duration) { resolve(); return; }
 
       for (const o of animObjs) o.animT = el * (o.animSpeed || 1);
-      paintVideoFrame(c2, cv, pageObjs);
+      paintVideoFrame(c2, cv, pageObjs, pageBgs[pageIdx] || null);
 
       const p = Math.min(1, el / duration);
       if (onProgress && p - lastSent > 0.01) {
@@ -8670,7 +9309,7 @@ await preloadBgImage();          // ← 新增：确保背景图已加载
   const aborted = videoAbort;
 
   for (const o of animObjs) o.animT = duration * (o.animSpeed || 1);
-  paintVideoFrame(c2, cv, pageObjs);
+  paintVideoFrame(c2, cv, pageObjs, pageBgs[pageIdx] || null);
   await new Promise(r => setTimeout(r, 280));
 
   if (rec.state !== 'inactive') rec.stop();
@@ -8875,6 +9514,11 @@ function serializeDoc() {
     view: { scale: view.scale, offsetX: view.offsetX, offsetY: view.offsetY },
     pageIndex: pageIndex,
     pages: pages.map(pg => pg.map(serializeObject)),
+    pageBgs: pageBgs.map(b => b ? {
+      src: b.src,
+      natW: b.natW, natH: b.natH,
+      x: b.x, y: b.y, w: b.w, h: b.h
+    } : null),
     customShapes: customShapes
   };
 }
@@ -8999,10 +9643,19 @@ async function applyDoc(doc) {
   await Promise.all(maskTasks);
   await Promise.all(imgTasks);
 
+  /* ★ 还原每页背景 */
+  const newPageBgs = newPages.map((_, i) => {
+    const rec = Array.isArray(doc.pageBgs) ? doc.pageBgs[i] : null;
+    if (!rec || typeof rec.src !== 'string') return null;
+    return makePageBgFromRecord(rec);
+  });
+  await Promise.all(newPageBgs.map(b => (b && b._ready) ? b._ready : null));
+
   stopAllAnimations();
   pushSnapshot();
 
   pages = newPages;
+  pageBgs = newPageBgs;
   pageIndex = Math.min(Math.max(0, parseInt(doc.pageIndex, 10) || 0), pages.length - 1);
   objects = pages[pageIndex];
   selection = [];
@@ -9103,12 +9756,14 @@ function loadDocFile() {
 pgLabel.addEventListener('click', () => {
   if (thumbPanel.classList.contains('show')) thumbPanel.classList.remove('show');
   else { buildThumbnails(); thumbPanel.classList.add('show'); }
+  document.body.classList.toggle('thumbs-open', thumbPanel.classList.contains('show'));
 });
 document.addEventListener('click', e => {
   if (!thumbPanel.classList.contains('show')) return;
   if (thumbPanel.contains(e.target)) return;
   if (e.target.closest('.corner-br')) return;
   thumbPanel.classList.remove('show');
+  document.body.classList.remove('thumbs-open');
 });
 function buildThumbnails() {
   thumbScroll.innerHTML = '';
@@ -9122,7 +9777,15 @@ function buildThumbnails() {
     cvs.width = thumbW; cvs.height = thumbH;
     const tctx = cvs.getContext('2d');
 
-paintBackgroundToCanvas(tctx, thumbW, thumbH, { solidFallback: true });
+    paintBackgroundToCanvas(tctx, thumbW, thumbH, { solidFallback: true });
+
+    /* ★ 页面背景也画进缩略图 */
+    const pbg = pageBgs[i];
+    if (pbg && pbg.img) {
+      const bs = Math.min(thumbW / pbg.w, thumbH / pbg.h);
+      const bw = pbg.w * bs, bh = pbg.h * bs;
+      tctx.drawImage(pbg.img, (thumbW - bw) / 2, (thumbH - bh) / 2, bw, bh);
+    }
 
     if (pg.length) {
       const bb = unionBBox(pg);
@@ -10647,11 +11310,13 @@ applyLibHidden();
 
   buildPenPanel(); buildBorderPanel(); buildFillPanel(); buildBgRow(); buildShapePanel();setupCustomBgUI();
   makeTouchScrollable(shapeGrid);
+  attachShapeGridSwipe();
   makeTouchScrollable(thumbScroll);
   makeTouchScrollable(libList);
   updateSaveDirUI();
 
   loadSnapSettings();
+  syncShapeLockUI();
 
   window.addEventListener('pointerdown', onPointerDown);
   window.addEventListener('pointermove', onPointerMove, { passive: false });
@@ -10662,35 +11327,48 @@ applyLibHidden();
     const tool = b.dataset.tool;
     if (tool === 'pen') {
       b.addEventListener('click', () => {
+        closeShapePanelLock();
         if (state.tool === 'pen') penPanel.classList.toggle('show');
         else setTool('pen', true);
       });
     } else if (tool === 'eraser') {
-      b.addEventListener('click', () => setTool('eraser'));
-      b.addEventListener('dblclick', e => { e.preventDefault(); setTool('eraser'); showEraseSlider(); });
+      b.addEventListener('click', () => { closeShapePanelLock(); setTool('eraser'); });
+      b.addEventListener('dblclick', e => { e.preventDefault(); closeShapePanelLock(); setTool('eraser'); showEraseSlider(); });
     } else {
-      b.addEventListener('click', () => setTool(tool));
+      b.addEventListener('click', () => { closeShapePanelLock(); setTool(tool); });
     }
   });
   document.getElementById('shapeBtn').addEventListener('click', () => {
+    const btn = document.getElementById('shapeBtn');
     if (shapePanel.classList.contains('show')) {
+      if (!shapePanelLocked) {
+        /* 第二次点击：锁定面板，连续选图形不关闭 */
+        shapePanelLocked = true;
+        syncShapeLockUI();
+        toast('形状面板已锁定：可连续选图形，在图形区左右滑动切换类别，再点「形状」退出', 3400);
+        return;
+      }
+      shapePanelLocked = false;
       shapePanel.classList.remove('show');
-      document.getElementById('shapeBtn').classList.remove('active');
-    } else {
-      const cats = getCategories().filter(c => catHasShapes(c.id));
-      if (!state.shapeCat && cats.length) state.shapeCat = cats[0].id;
-      let first = null;
-      for (const k in PB.shapes) {
-        const s = PB.shapes[k];
-        if (!s.hidden && s.cat === state.shapeCat) { first = k; break; }
-      }
-      if (first) setTool(first);
-      else {
-        shapePanel.classList.add('show');
-        document.getElementById('shapeBtn').classList.add('active');
-        penPanel.classList.remove('show');
-      }
+      btn.classList.remove('active');
+      syncShapeLockUI();
+      return;
     }
+    shapePanelLocked = false;
+    const cats = getCategories().filter(c => catHasShapes(c.id));
+    if (!state.shapeCat && cats.length) state.shapeCat = cats[0].id;
+    let first = null;
+    for (const k in PB.shapes) {
+      const s = PB.shapes[k];
+      if (!s.hidden && s.cat === state.shapeCat) { first = k; break; }
+    }
+    if (first) setTool(first);
+    else {
+      shapePanel.classList.add('show');
+      btn.classList.add('active');
+      penPanel.classList.remove('show');
+    }
+    syncShapeLockUI();
   });
   undoBtn.addEventListener('click', undo);
   redoBtn.addEventListener('click', redo);
@@ -10707,7 +11385,7 @@ applyLibHidden();
 
   resize();
 
-  snapshots = [{ pages: pages.map(pg => pg.map(copyObj)), pageIndex: 0 }];
+  snapshots = [{ pages: pages.map(pg => pg.map(copyObj)), pageBgs: pageBgs.slice(), pageIndex: 0 }];
   snapIndex = 0;
   updateHistoryButtons();
   updatePageUI();
