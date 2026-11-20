@@ -267,6 +267,74 @@ async function getJSON(path, token) {
   }
 }
 
+
+/* ===== 5a. 早期窗口控件（激活前也能最小化 / 关闭） ===== */
+let __earlyWinCtrl = null;
+
+function getTauriWindow() {
+  const T = window.__TAURI__;
+  const internals = window.__TAURI_INTERNALS__;
+  let appWindow = null;
+
+  if (T && T.window) {
+    if (typeof T.window.getCurrentWindow === 'function') {
+      appWindow = T.window.getCurrentWindow();
+    } else if (T.window.getCurrent) {
+      appWindow = T.window.getCurrent();
+    } else if (T.window.appWindow) {
+      appWindow = T.window.appWindow;
+    }
+  }
+  if (!appWindow && T && T.appWindow) appWindow = T.appWindow;
+
+  if (!appWindow && internals && typeof internals.invoke === 'function') {
+    const meta = internals.metadata || {};
+    const label = (meta.currentWindow && meta.currentWindow.label) || 'main';
+    appWindow = {
+      minimize: () => internals.invoke('plugin:window|minimize', { label }),
+      close:    () => internals.invoke('plugin:window|close',    { label })
+    };
+  }
+  return appWindow;
+}
+
+function setupEarlyWindowControls() {
+  const appWindow = getTauriWindow();
+  if (!appWindow) return;                       // 浏览器环境直接跳过
+
+  const minBtn   = document.getElementById('minimizeBtn');
+  const closeBtn = document.getElementById('closeAppBtn');
+  if (!minBtn || !closeBtn) return;
+
+  /* 显示按钮 */
+  minBtn.style.display   = '';
+  closeBtn.style.display = '';
+
+  /* 避免重复绑定 */
+  if (__earlyWinCtrl) return;
+
+  __earlyWinCtrl = new AbortController();
+  const sig = __earlyWinCtrl.signal;
+
+  minBtn.addEventListener('click', async () => {
+    try { await appWindow.minimize(); } catch (e) {}
+  }, { signal: sig });
+
+  closeBtn.addEventListener('click', async () => {
+    /* 未激活状态下无内容需要保存，直接关闭 */
+    try { await appWindow.close(); }
+    catch (e) { try { window.close(); } catch (_) {} }
+  }, { signal: sig });
+}
+
+function cleanupEarlyWindowControls() {
+  if (__earlyWinCtrl) {
+    try { __earlyWinCtrl.abort(); } catch (e) {}
+    __earlyWinCtrl = null;
+  }
+}
+
+
 /* ===== 5. 核心流程：确保已激活 ===== */
 
 let __licenseInfo = {
@@ -279,6 +347,7 @@ let __licenseInfo = {
 };
 
 async function ensureActivated() {
+  setupEarlyWindowControls();   // ← 新增：先让按钮出现，绑定简单监听
   /* ---------- 0. 本次运行已激活成功 → 直接返回，避免重复网络请求 ---------- */
   if (__activatedOk) return true;
 
@@ -628,8 +697,12 @@ function showActivationUI(message) {
       if (e.key === 'Enter') activate();
     });
 
-    document.getElementById('pbLicExit').addEventListener('click', function () {
-      closeWith(false);
+    document.getElementById('pbLicExit').addEventListener('click', async function () {
+      const appWindow = getTauriWindow();
+      if (appWindow) {
+        try { await appWindow.close(); return; } catch (e) {}
+      }
+      closeWith(false);           // 浏览器环境仍走原逻辑
     });
 
     setTimeout(function () { try { input.focus(); } catch (e) {} }, 100);
@@ -647,7 +720,8 @@ const licenseAPI = {
   getLicenseInfo: getLicenseInfo,
   isOffline: isOffline,
   check: async function () { return !!(await readAuth()); },
-  showActivationUI: function (msg) { return showActivationUI(msg); }
+  showActivationUI: function (msg) { return showActivationUI(msg); },
+  cleanupEarlyWindowControls: cleanupEarlyWindowControls   // ← 新增
 };
 
 // 【修补】防止控制台直接覆盖或删除该对象
