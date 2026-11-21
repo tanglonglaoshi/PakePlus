@@ -1,4 +1,4 @@
-/* ============================================================================
+﻿/* ============================================================================
  *  PhysBoard 主程序 app.js  ——  伪无限画布 / 手势 / 手掌擦除 / 图片 / 视频
  *  必须在 license.js 之后加载
  * ============================================================================ */
@@ -537,6 +537,34 @@ const view = {
   offsetX: 0,
   offsetY: 0
 };
+let pageViews = [{ scale: 1, offsetX: 0, offsetY: 0 }];   // ★ 每页独立平移/缩放
+
+function defaultView() {
+  return { scale: 1, offsetX: 0, offsetY: 0 };
+}
+function copyView(v) {
+  return { scale: v.scale, offsetX: v.offsetX, offsetY: v.offsetY };
+}
+function saveCurrentPageView() {
+  if (pageViews[pageIndex]) pageViews[pageIndex] = copyView(view);
+}
+function applyPageView(idx) {
+  const v = pageViews[idx];
+  if (v && typeof v.scale === 'number') {
+    view.scale = Math.max(view.minScale, Math.min(view.maxScale, v.scale));
+    view.offsetX = v.offsetX || 0;
+    view.offsetY = v.offsetY || 0;
+  } else {
+    view.scale = 1;
+    view.offsetX = 0;
+    view.offsetY = 0;
+  }
+  pageViews[idx] = copyView(view);
+}
+function syncPageViews() {
+  while (pageViews.length < pages.length) pageViews.push(defaultView());
+  if (pageViews.length > pages.length) pageViews.length = pages.length;
+}
 function screenToWorld(x, y) {
   return { x: (x - view.offsetX) / view.scale, y: (y - view.offsetY) / view.scale };
 }
@@ -554,6 +582,7 @@ function resetView() {
   view.scale = 1;
   view.offsetX = 0;
   view.offsetY = 0;
+  if (pageViews[pageIndex]) pageViews[pageIndex] = copyView(view);
   render(); drawPreview(); updateSelBarPosition();
   if (typeof positionTextEditor === 'function') positionTextEditor();
 }
@@ -2315,8 +2344,10 @@ function updatePlayButtons() {
  * ===================================================================== */
 const MAX_SNAPSHOTS = 30;
 function pushSnapshot() {
+  syncPageViews();
+  saveCurrentPageView();
   snapshots = snapshots.slice(0, snapIndex + 1);
-  snapshots.push({ pages: pages.map(pg => pg.map(copyObj)), pageBgs: pageBgs.slice(), pageIndex });
+  snapshots.push({ pages: pages.map(pg => pg.map(copyObj)), pageBgs: pageBgs.slice(), pageViews: pageViews.map(copyView), pageIndex });
   snapIndex = snapshots.length - 1;
   if (snapshots.length > MAX_SNAPSHOTS) { snapshots.shift(); snapIndex--; }
   updateHistoryButtons();
@@ -2333,6 +2364,9 @@ function restoreSnapshot(s) {
   if (Array.isArray(s.pageBgs)) pageBgs = s.pageBgs.slice();
   normalizePageBgs();
   pageIndex = Math.min(s.pageIndex, pages.length - 1);
+  pageViews = Array.isArray(s.pageViews) ? s.pageViews.map(copyView) : pages.map(defaultView);
+  syncPageViews();
+  applyPageView(pageIndex);
   objects = pages[pageIndex];
   selection = [];
   updateSelBar(); updatePageUI(); render(); drawPreview(); updateHistoryButtons();
@@ -2349,6 +2383,7 @@ function updateHistoryButtons() {
  * ===================================================================== */
 function updatePageUI() {
   normalizePageBgs();
+  syncPageViews();
   pgLabel.textContent = (pageIndex + 1) + ' / ' + pages.length;
   document.getElementById('prevPage').disabled = pageIndex <= 0;
   document.getElementById('nextPage').disabled = pageIndex >= pages.length - 1;
@@ -2356,8 +2391,15 @@ function updatePageUI() {
 }
 function goPage(n) {
   if (n < 0 || n >= pages.length) return;
-  pageIndex = n;
-  objects = pages[pageIndex];
+  if (n !== pageIndex) {
+    syncPageViews();
+    saveCurrentPageView();
+    pageIndex = n;
+    objects = pages[pageIndex];
+    applyPageView(pageIndex);
+  } else {
+    objects = pages[pageIndex];
+  }
   selection = [];
   updateSelBar(); updatePageUI(); render(); drawPreview();
   if (thumbPanel.classList.contains('show')) {
@@ -2367,10 +2409,14 @@ function goPage(n) {
   }
 }
 function addPage() {
+  syncPageViews();
+  saveCurrentPageView();
   pages.push([]);
   pageBgs.push(null);
+  pageViews.push(defaultView());
   pageIndex = pages.length - 1;
   objects = pages[pageIndex];
+  applyPageView(pageIndex);
   selection = [];
   updateSelBar(); updatePageUI(); render(); drawPreview(); pushSnapshot();
   if (thumbPanel.classList.contains('show')) buildThumbnails();
@@ -2393,12 +2439,16 @@ function deletePage(idx) {
   }
 
   const no = idx + 1;
+  syncPageViews();
+  saveCurrentPageView();
   pages.splice(idx, 1);
   pageBgs.splice(idx, 1);
+  pageViews.splice(idx, 1);
   if (pageIndex >= pages.length) pageIndex = pages.length - 1;
   else if (idx < pageIndex) pageIndex--;
 
   objects = pages[pageIndex];
+  applyPageView(pageIndex);
   selection = [];
 
   pushSnapshot();
@@ -8198,6 +8248,20 @@ menuPop.addEventListener('click', e => {
   const act = btn.dataset.act;
   hideMenu();
   if (act === 'miniapp') openMiniappLauncher();
+  else if (act === 'shot') {
+    var tauriInvoke = (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
+      ? window.__TAURI__.core.invoke.bind(window.__TAURI__.core)
+      : (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)
+        ? window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__)
+        : null;
+    if (tauriInvoke) {
+      tauriInvoke('start_shot').catch(function () {
+        toast('截图启动失败，请重启程序后再试');
+      });
+    } else {
+      toast('屏幕截图仅在桌面程序里可用');
+    }
+  }
   else if (act === 'import') openModal('importModal');
   else if (act === 'export') openModal('exportChooserModal');
   else if (act === 'lib') openLibModal();
@@ -8209,6 +8273,28 @@ menuPop.addEventListener('click', e => {
 document.addEventListener('click', e => {
   if (!menuPop.contains(e.target) && !e.target.closest('#menuBtn')) hideMenu();
 });
+
+/* 菜单里的截图快捷键标签：以 Rust 实际注册成功的组合为准 */
+(function syncShotHotkeyLabel() {
+  var ti = (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
+    ? window.__TAURI__.core.invoke.bind(window.__TAURI__.core)
+    : (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)
+      ? window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__)
+      : null;
+  if (!ti) return;
+  function apply(label) {
+    if (!label) return false;
+    var el = document.getElementById('shotHotkeyLabel');
+    if (el) el.textContent = label;
+    return true;
+  }
+  ti('shot_hotkey_label').then(function (label) {
+    if (apply(label)) return;
+    setTimeout(function () {
+      ti('shot_hotkey_label').then(apply).catch(function () {});
+    }, 1200);
+  }).catch(function () {});
+})();
 
 document.getElementById('importModal').addEventListener('click', e => {
   const opt = e.target.closest('[data-import]');
@@ -8859,9 +8945,12 @@ document.getElementById('pdfInsertBtn').addEventListener('click', async () => {
 
     await Promise.all(bgs.map(b => b._ready));
 
+    syncPageViews();
+    saveCurrentPageView();
     selection = [];
     if (mode === 'current') {
       pageBgs[pageIndex] = bgs[0];
+      pageViews[pageIndex] = defaultView();
       objects = pages[pageIndex];
     } else if (!pages[pageIndex].length && !pageBgs[pageIndex]) {
       /* 当前页是空白页：直接用它承载第一页，避免前面多出一张空白页 */
@@ -8869,10 +8958,13 @@ document.getElementById('pdfInsertBtn').addEventListener('click', async () => {
       objects = pages[pageIndex];
       pages.splice(pageIndex + 1, 0, ...bgs.slice(1).map(() => []));
       pageBgs.splice(pageIndex + 1, 0, ...bgs.slice(1));
+      pageViews.splice(pageIndex + 1, 0, ...bgs.slice(1).map(() => defaultView()));
+      pageViews[pageIndex] = defaultView();
     } else {
       const insertAt = pageIndex + 1;
       pages.splice(insertAt, 0, ...bgs.map(() => []));
       pageBgs.splice(insertAt, 0, ...bgs);
+      pageViews.splice(insertAt, 0, ...bgs.map(() => defaultView()));
       pageIndex = insertAt;
       objects = pages[pageIndex];
     }
@@ -8882,6 +8974,7 @@ document.getElementById('pdfInsertBtn').addEventListener('click', async () => {
     view.scale = 1;
     view.offsetX = 0;
     view.offsetY = 0;
+    pageViews[pageIndex] = copyView(view);
 
     setTool('select', true);
     pushSnapshot();
@@ -9512,6 +9605,11 @@ function serializeDoc() {
     exportedAt: new Date().toISOString(),
     bg: state.bg,
     view: { scale: view.scale, offsetX: view.offsetX, offsetY: view.offsetY },
+    pageViews: (function () {
+      syncPageViews();
+      saveCurrentPageView();
+      return pageViews.map(copyView);
+    })(),
     pageIndex: pageIndex,
     pages: pages.map(pg => pg.map(serializeObject)),
     pageBgs: pageBgs.map(b => b ? {
@@ -9666,11 +9764,24 @@ async function applyDoc(doc) {
   selState = null;
 
   if (doc.bg && BG_PRESETS.some(p => p.id === doc.bg)) applyBg(doc.bg);
-  if (doc.view && typeof doc.view.scale === 'number') {
-    view.scale = Math.max(view.minScale, Math.min(view.maxScale, doc.view.scale));
-    view.offsetX = doc.view.offsetX || 0;
-    view.offsetY = doc.view.offsetY || 0;
+
+  pageViews = pages.map(defaultView);
+  if (Array.isArray(doc.pageViews)) {
+    for (let i = 0; i < Math.min(pageViews.length, doc.pageViews.length); i++) {
+      const v = doc.pageViews[i];
+      if (v && typeof v.scale === 'number') {
+        pageViews[i] = { scale: v.scale, offsetX: v.offsetX || 0, offsetY: v.offsetY || 0 };
+      }
+    }
   }
+  if (doc.view && typeof doc.view.scale === 'number') {
+    pageViews[pageIndex] = {
+      scale: Math.max(view.minScale, Math.min(view.maxScale, doc.view.scale)),
+      offsetX: doc.view.offsetX || 0,
+      offsetY: doc.view.offsetY || 0
+    };
+  }
+  applyPageView(pageIndex);
 
   buildShapePanel();
   setTool('select', true);
@@ -9894,13 +10005,73 @@ let widgetZ = 62;
 let widgetSpawnCount = 0;
 const openWidgets = new Map();
 
+function makeWidgetResizable(el) {
+  const grip = el.querySelector('.widget-resize');
+  if (!grip) return;
+  let activeId = null, sx = 0, sy = 0, sw = 0, sh = 0, moved = false;
+
+  grip.addEventListener('pointerdown', e => {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    e.preventDefault();
+    e.stopPropagation();
+    const r = el.getBoundingClientRect();
+    sw = r.width; sh = r.height;
+    if (!el._baseW || !el._baseH) { el._baseW = sw; el._baseH = sh; }
+    el.style.width = sw + 'px';
+    el.style.height = sh + 'px';
+    el.classList.add('free-sized', 'sizing');
+    widgetZ++;
+    el.style.zIndex = widgetZ;
+    sx = e.clientX; sy = e.clientY;
+    activeId = e.pointerId;
+    moved = false;
+    try { grip.setPointerCapture(activeId); } catch (err) {}
+  });
+
+  grip.addEventListener('pointermove', e => {
+    if (e.pointerId !== activeId) return;
+    moved = true;
+    const maxW = window.innerWidth - 12;
+    const maxH = window.innerHeight - 12;
+    const w = Math.max(200, Math.min(maxW, sw + (e.clientX - sx)));
+    const h = Math.max(120, Math.min(maxH, sh + (e.clientY - sy)));
+    el.style.width = w + 'px';
+    el.style.height = h + 'px';
+    const ws = Math.max(0.7, Math.min(8,
+      Math.sqrt((w / el._baseW) * (h / el._baseH))));
+    el.style.setProperty('--ws', ws.toFixed(3));
+    if (typeof el._onResize === 'function') el._onResize();
+  });
+
+  const end = e => {
+    if (e.pointerId !== activeId) return;
+    activeId = null;
+    el.classList.remove('sizing');
+    try { grip.releasePointerCapture(e.pointerId); } catch (err) {}
+    if (typeof el._onResize === 'function') el._onResize();
+  };
+  grip.addEventListener('pointerup', end);
+  grip.addEventListener('pointercancel', end);
+
+  grip.addEventListener('dblclick', e => {
+    e.stopPropagation();
+    el.classList.remove('free-sized', 'sizing');
+    el.style.width = '';
+    el.style.height = '';
+    el.style.setProperty('--ws', '1');
+    el._baseW = 0;
+    el._baseH = 0;
+    if (typeof el._onResize === 'function') el._onResize();
+  });
+}
+
 function makeWidgetDraggable(el) {
   const handle = el.querySelector('.widget-head');
   if (!handle) return;
   let startX = 0, startY = 0, startLeft = 0, startTop = 0, activeId = null;
 
   const onDown = e => {
-    if (e.target.closest('.widget-close, .widget-zoom, button, input, textarea, select, .mini-btn')) return;
+    if (e.target.closest('.widget-close, .widget-resize, .widget-zoom, button, input, textarea, select, .mini-btn')) return;
     const rect = el.getBoundingClientRect();
     startX = e.clientX; startY = e.clientY;
     startLeft = rect.left; startTop = rect.top;
@@ -10035,24 +10206,16 @@ function createWidget(appId, title, iconSvg) {
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">' + iconSvg + '</svg>' +
         '<span>' + escapeHtml(title) + '</span>' +
       '</div>' +
-      '<button class="widget-zoom" title="放大 / 还原（1× → 2× → 4×）">' + WIDGET_ZOOM_ICON + '</button>' +
       '<button class="widget-close" title="关闭">' +
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>' +
       '</button>' +
     '</div>' +
-    '<div class="widget-body"></div>';
+    '<div class="widget-body"></div>' +
+    '<div class="widget-resize" title="拖动调整大小 · 双击恢复默认"></div>';
   widgetLayer.appendChild(el);
   makeWidgetDraggable(el);
 
-  el._scale = 1;
-  el._scaleIdx = 0;
-  el.querySelector('.widget-zoom').addEventListener('click', ev => {
-    ev.stopPropagation();
-    el._scaleIdx = (el._scaleIdx + 1) % WIDGET_ZOOM_STEPS.length;
-    widgetZ++;
-    el.style.zIndex = widgetZ;
-    applyWidgetScale(el, WIDGET_ZOOM_STEPS[el._scaleIdx]);
-  });
+  makeWidgetResizable(el);
 
   const cleanup = [];
   const api = {
@@ -10759,6 +10922,779 @@ function openDiceApp() {
   };
 }
 
+/* ===== 小程序公共工具 ===== */
+function onWidgetDestroy(id, fn) {
+  const w = openWidgets.get(id);
+  if (!w) return;
+  const orig = w.destroy;
+  w.destroy = () => {
+    try { fn(); } catch (e) {}
+    orig();
+  };
+}
+
+function sizeWidget(el, w, h) {
+  const maxW = Math.max(260, window.innerWidth - 40);
+  const maxH = Math.max(220, window.innerHeight - 80);
+  el.classList.add('free-sized');
+  el.style.width = Math.min(w, maxW) + 'px';
+  el.style.height = Math.min(h, maxH) + 'px';
+  const body = el.querySelector('.widget-body');
+  if (body) body.classList.add('no-pad');
+}
+
+function fitCanvas(cv, wrap) {
+  wrap.style.maxHeight = 'none';
+  for (let i = 0; i < wrap.children.length; i++) {
+    const ch = wrap.children[i];
+    if (ch.tagName !== 'CANVAS' && !ch.style.zIndex) ch.style.zIndex = '3';
+  }
+  const r = wrap.getBoundingClientRect();
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.max(40, Math.floor(r.width || wrap.clientWidth || 320));
+  const h = Math.max(40, Math.floor(r.height || wrap.clientHeight || 220));
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr);
+    cv.height = Math.round(h * dpr);
+  }
+  cv.style.width = w + 'px';
+  cv.style.height = h + 'px';
+  return { w: w, h: h, dpr: dpr };
+}
+
+/* =====================================================================
+ * 拾音频谱
+ * ===================================================================== */
+function openSpectrumApp() {
+  const el = createWidget('spectrum', '拾音频谱',
+    '<path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 7v10M22 11v2"/>');
+  sizeWidget(el, 560, 380);
+  const body = el.querySelector('.widget-body');
+  body.classList.add('no-pad');
+  body.innerHTML =
+    '<div class="mini-canvas spec-wrap">' +
+      '<canvas data-el="cv"></canvas>' +
+      '<div class="spec-hud">' +
+        '<span class="spec-status" data-el="st">麦克风未开启</span>' +
+        '<span class="spec-actions">' +
+          '<button class="mini-btn primary" data-act="start">开启</button>' +
+          '<button class="mini-btn" data-act="stop">停止</button>' +
+        '</span>' +
+      '</div>' +
+    '</div>';
+  const wrap = body.querySelector('.spec-wrap');
+  const cv = body.querySelector('[data-el=cv]');
+  const ctx = cv.getContext('2d');
+  const st = body.querySelector('[data-el=st]');
+
+  const BARS = 72;
+  const bars = new Float32Array(BARS);
+  const peaks = new Float32Array(BARS);
+  let audioCtx = null, analyser = null, srcNode = null, stream = null;
+  let freq = null, timeData = null, raf = 0, running = false, level = 0;
+
+  function fit() { fitCanvas(cv, wrap); }
+
+  function draw(now) {
+    const size = fitCanvas(cv, wrap);
+    const w = size.w, h = size.h, dpr = size.dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const g = ctx.createRadialGradient(w * 0.5, h * 0.15, 10, w * 0.5, h * 0.5, Math.max(w, h) * 0.75);
+    g.addColorStop(0, '#0a1220');
+    g.addColorStop(0.55, '#050a13');
+    g.addColorStop(1, '#02040a');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+
+    if (running && analyser) {
+      analyser.getByteFrequencyData(freq);
+      analyser.getByteTimeDomainData(timeData);
+
+      /* 自动增益：不管人声还是音乐，都按当前最强频段归一化，安静时也能看到律动 */
+      const usable = Math.max(8, Math.floor(freq.length * 0.72));
+      let maxRaw = 0;
+      for (let i = 0; i < usable; i++) {
+        const v = freq[i] / 255;
+        if (v > maxRaw) maxRaw = v;
+      }
+      const auto = maxRaw > 0.02 ? Math.min(7, 0.92 / maxRaw) : 1;
+
+      let rms = 0;
+      for (let i = 0; i < timeData.length; i += 4) {
+        const x = (timeData[i] - 128) / 128;
+        rms += x * x;
+      }
+      rms = Math.sqrt(rms / Math.max(1, timeData.length / 4));
+      level = Math.min(1, rms * 4.5);
+
+      for (let i = 0; i < BARS; i++) {
+        const idx = Math.min(usable - 1, Math.floor(i / (BARS - 1) * usable));
+        const raw = freq[idx] / 255;
+        let v = raw > 0.012 ? Math.pow((raw - 0.012) * auto, 0.8) : 0;
+        if (v > 1) v = 1;
+        bars[i] = Math.max(v, bars[i] * 0.86);
+        peaks[i] = Math.max(peaks[i] - 0.01, bars[i]);
+      }
+    } else {
+      for (let i = 0; i < BARS; i++) {
+        const t = i / BARS;
+        const v = 0.05 + 0.045 * (1 + Math.sin(now / 620 + t * 9)) + 0.02 * Math.sin(now / 240 + t * 31);
+        bars[i] = v;
+        peaks[i] = Math.max(0, peaks[i] - 0.01);
+      }
+      level = 0;
+    }
+
+    if (running && timeData) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.strokeStyle = 'rgba(125,211,252,.30)';
+      ctx.lineWidth = 1.5;
+      ctx.shadowColor = 'rgba(56,189,248,.55)';
+      ctx.shadowBlur = 12;
+      ctx.beginPath();
+      for (let i = 0; i < timeData.length; i += 2) {
+        const x = i / (timeData.length - 1) * w;
+        const y = h * 0.30 + ((timeData[i] - 128) / 128) * h * 0.16;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    const baseY = h * 0.78;
+    const maxBar = h * 0.56;
+    const step = w / BARS;
+    const bw = Math.max(2, step * 0.56);
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < BARS; i++) {
+      const t = i / (BARS - 1);
+      const hue = 188 + t * 152;
+      const bh = Math.max(2, bars[i] * maxBar);
+      const x = i * step + (step - bw) / 2;
+      const y = baseY - bh;
+      ctx.fillStyle = 'hsla(' + hue + ',95%,62%,.95)';
+      ctx.shadowColor = 'hsla(' + hue + ',100%,60%,.85)';
+      ctx.shadowBlur = 14;
+      ctx.fillRect(x, y, bw, bh);
+      ctx.shadowBlur = 0;
+
+      const py = baseY - peaks[i] * maxBar;
+      ctx.fillStyle = 'hsla(' + hue + ',100%,85%,.9)';
+      ctx.fillRect(x, py - 2, bw, 2);
+    }
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 0.16;
+    for (let i = 0; i < BARS; i++) {
+      const t = i / (BARS - 1);
+      const hue = 188 + t * 152;
+      const bh = Math.max(2, bars[i] * maxBar);
+      const x = i * step + (step - bw) / 2;
+      ctx.fillStyle = 'hsla(' + hue + ',100%,62%,.9)';
+      ctx.fillRect(x, baseY + 2, bw, bh * 0.35);
+    }
+    ctx.restore();
+
+    ctx.strokeStyle = 'rgba(56,189,248,.14)';
+    ctx.lineWidth = 1;
+    for (let k = 1; k <= 3; k++) {
+      const y = baseY - maxBar * k / 3;
+      ctx.beginPath(); ctx.moveTo(10, y); ctx.lineTo(w - 10, y); ctx.stroke();
+    }
+    ctx.strokeStyle = 'rgba(125,211,252,.35)';
+    ctx.beginPath(); ctx.moveTo(10, baseY); ctx.lineTo(w - 10, baseY); ctx.stroke();
+
+    st.textContent = running
+      ? '正在拾音 · 音量 ' + Math.round(level * 100) + '%'
+      : '麦克风未开启';
+  }
+
+  function loop(now) {
+    draw(now || performance.now());
+    raf = requestAnimationFrame(loop);
+  }
+
+  async function start() {
+    if (running) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      st.textContent = '当前环境不支持麦克风';
+      return;
+    }
+    try {
+      st.textContent = '正在请求麦克风权限…';
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      srcNode = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.7;
+      analyser.minDecibels = -90;
+      analyser.maxDecibels = -10;
+      srcNode.connect(analyser);
+      freq = new Uint8Array(analyser.frequencyBinCount);
+      timeData = new Uint8Array(analyser.fftSize);
+      running = true;
+      st.textContent = '正在拾音…';
+    } catch (e) {
+      running = false;
+      const msg = e && e.name === 'NotAllowedError'
+        ? '麦克风被拒绝：请在 Windows 设置 → 隐私 → 麦克风 中允许'
+        : '无法访问麦克风';
+      st.textContent = msg;
+      toast(msg, 3200);
+    }
+  }
+
+  function stop() {
+    running = false;
+    try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+    try { if (srcNode) srcNode.disconnect(); } catch (e) {}
+    try { if (audioCtx) audioCtx.close(); } catch (e) {}
+    stream = null; srcNode = null; audioCtx = null; analyser = null; timeData = null;
+    if (st) st.textContent = '麦克风未开启';
+  }
+
+  wireWidgetActions(el, { start: start, stop: stop });
+  onWidgetDestroy('spectrum', () => {
+    stop();
+    if (raf) cancelAnimationFrame(raf);
+  });
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(() => fit()).observe(wrap);
+  }
+  el._onResize = () => fit();
+  fit();
+  loop();
+}
+
+/* =====================================================================
+ * 物理公式球
+ * ===================================================================== */
+const FB_KEY = 'pb_formula_ball_v1';
+const FB_DEFAULT = [
+  "v = v_0 + a t",
+  "x = v_0 t + \\frac{1}{2} a t^2",
+  "v^2 - v_0^2 = 2 a x",
+  "x = \\frac{(v_0 + v)t}{2}",
+  "a = \\frac{\\Delta v}{\\Delta t}",
+  "F = m a",
+  "G = m g",
+  "N = m g \\cos\\theta",
+  "f = \\mu N",
+  "F = k x",
+  "F = G\\frac{m_1 m_2}{r^2}",
+  "F = m\\frac{v^2}{r}",
+  "a = \\frac{v^2}{r} = \\omega^2 r",
+  "\\omega = \\frac{2\\pi}{T}",
+  "v = \\omega r",
+  "T = 2\\pi\\sqrt{\\frac{l}{g}}",
+  "T = 2\\pi\\sqrt{\\frac{m}{k}}",
+  "W = F s \\cos\\theta",
+  "P = \\frac{W}{t}",
+  "P = F v",
+  "E_k = \\frac{1}{2} m v^2",
+  "E_p = m g h",
+  "E = E_k + E_p",
+  "W_{\\text{合}} = \\Delta E_k",
+  "p = m v",
+  "I = F t = \\Delta p",
+  "m_1 v_1 + m_2 v_2 = m_1 v_1^{\\prime} + m_2 v_2^{\\prime}",
+  "F = -k x",
+  "E = \\frac{1}{2} k x^2",
+  "Q = c m \\Delta T",
+  "Q = m L",
+  "p V = n R T",
+  "F = q E",
+  "E = \\frac{F}{q}",
+  "E = k\\frac{Q}{r^2}",
+  "U = \\frac{W}{q}",
+  "U = E d",
+  "C = \\frac{Q}{U}",
+  "C = \\frac{\\varepsilon S}{4\\pi k d}",
+  "R = \\rho\\frac{L}{S}",
+  "R = \\frac{U}{I}",
+  "P = U I = I^2 R",
+  "Q = I t",
+  "R_{\\text{串}} = R_1 + R_2",
+  "\\frac{1}{R_{\\text{并}}} = \\frac{1}{R_1} + \\frac{1}{R_2}",
+  "F = q v B",
+  "B = \\frac{F}{I L}",
+  "\\Phi = B S",
+  "\\varepsilon = \\frac{\\Delta\\Phi}{\\Delta t}",
+  "\\varepsilon = B L v",
+  "n_1 \\sin\\theta_1 = n_2 \\sin\\theta_2",
+  "n = \\frac{c}{v}",
+  "\\frac{1}{f} = \\frac{1}{u} + \\frac{1}{v}",
+  "v = \\lambda f",
+  "T = \\frac{1}{f}",
+  "E = h \\nu",
+  "p = \\frac{h}{\\lambda}",
+  "E = m c^2",
+  "\\Delta E = \\Delta m c^2",
+  "\\lambda = \\frac{h}{p}",
+  "g = \\frac{G M}{R^2}",
+  "v_1 = \\sqrt{g R}",
+  "T = 2\\pi\\sqrt{\\frac{r^3}{G M}}",
+  "F = m \\omega^2 r",
+  "v = \\sqrt{2 g h}",
+  "W = q U",
+  "E = \\frac{U}{d}",
+  "I = \\frac{U}{R}",
+  "P = I^2 R",
+  "\\eta = \\frac{W_{\\text{有}}}{W_{\\text{总}}}",
+  "F = B I L",
+  "E = B L v",
+  "\\varepsilon = n\\frac{\\Delta\\Phi}{\\Delta t}",
+  "u = \\frac{f v}{v - f}",
+  "m = -\\frac{v}{u}",
+  "\\frac{\\sin i}{\\sin r} = n",
+  "\\lambda = \\frac{v}{f}",
+  "\\Delta x = \\frac{\\lambda L}{d}",
+  "E = \\frac{h c}{\\lambda}",
+  "m = \\frac{m_0}{\\sqrt{1 - v^2/c^2}}",
+  "p = \\frac{E}{c}",
+  "R = \\frac{m v}{q B}",
+  "T = \\frac{2\\pi m}{q B}",
+  "F = \\frac{\\mu_0 I_1 I_2 L}{2\\pi d}",
+  "B = \\frac{\\mu_0 I}{2\\pi r}",
+  "g = 9.8\\ \\text{m/s}^2",
+  "G = 6.67\\times10^{-11}\\ \\text{N}\\cdot\\text{m}^2/\\text{kg}^2",
+  "k = 9.0\\times10^9\\ \\text{N}\\cdot\\text{m}^2/\\text{C}^2",
+  "e = 1.6\\times10^{-19}\\ \\text{C}",
+  "h = 6.63\\times10^{-34}\\ \\text{J}\\cdot\\text{s}",
+  "c = 3.0\\times10^8\\ \\text{m/s}",
+  "\\alpha = \\frac{\\Delta\\omega}{\\Delta t}",
+  "\\beta = \\frac{\\Delta\\theta}{\\Delta t}"
+];
+
+function fbLoad() {
+  try {
+    const raw = localStorage.getItem(FB_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr) && arr.length) return arr.filter(x => typeof x === 'string' && x.trim());
+    }
+  } catch (e) {}
+  return FB_DEFAULT.slice();
+}
+function fbSave(list) {
+  try { localStorage.setItem(FB_KEY, JSON.stringify(list)); } catch (e) {}
+}
+
+function fbToLatex(s) {
+  let t = String(s == null ? '' : s).trim();
+  if (!t) return '';
+  if (t.charAt(0) === '$') t = t.replace(/^\$+|\$+$/g, '').trim();
+  if (/\\[a-zA-Z]/.test(t)) return t;
+
+  const g = {
+    'α': '\\alpha ', 'β': '\\beta ', 'γ': '\\gamma ', 'θ': '\\theta ',
+    'μ': '\\mu ', 'Δ': '\\Delta ', 'δ': '\\delta ', 'ω': '\\omega ',
+    'π': '\\pi ', 'ρ': '\\rho ', 'λ': '\\lambda ', 'ν': '\\nu ',
+    'ε': '\\varepsilon ', 'Φ': '\\Phi ', 'φ': '\\varphi ', 'Ω': '\\Omega ',
+    'η': '\\eta ', 'τ': '\\tau ', 'σ': '\\sigma '
+  };
+  for (const k in g) t = t.split(k).join(g[k]);
+
+  t = t.replace(/√\s*\(([^()]*)\)/g, '\\sqrt{$1}');
+  t = t.replace(/√\s*([A-Za-z0-9]+)/g, '\\sqrt{$1}');
+  t = t.replace(/\b(sin|cos|tan|log|ln)\b/g, '\\$1 ');
+  t = t.replace(/([A-Za-z])_?(\d+)/g, '$1_{$2}');
+  t = t.replace(/\b(\d+)\s*\/\s*(\d+)\b/g, '\\frac{$1}{$2}');
+  t = t.replace(/\b([A-Za-z])\s*\/\s*([A-Za-z0-9]+)\b/g, '\\frac{$1}{$2}');
+  t = t.replace(/([A-Za-z])合/g, '$1_{\\text{合}}');
+  return t;
+}
+
+function fbPlain(s) {
+  let t = String(s == null ? '' : s);
+  t = t.replace(/^\$+|\$+$/g, '');
+  const g = {
+    alpha: 'α', beta: 'β', gamma: 'γ', theta: 'θ', mu: 'μ', Delta: 'Δ',
+    delta: 'δ', omega: 'ω', pi: 'π', rho: 'ρ', lambda: 'λ', nu: 'ν',
+    varepsilon: 'ε', epsilon: 'ε', Phi: 'Φ', phi: 'φ', varphi: 'φ',
+    Omega: 'Ω', eta: 'η', tau: 'τ', sigma: 'σ', Sigma: 'Σ'
+  };
+  t = t.replace(/\\(alpha|beta|gamma|theta|mu|Delta|delta|omega|pi|rho|lambda|nu|varepsilon|epsilon|Phi|phi|varphi|Omega|eta|tau|sigma|Sigma)\b/g,
+    function (m, k) { return g[k] || m; });
+  t = t.replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, '($1)/($2)');
+  t = t.replace(/\\sqrt\{([^{}]*)\}/g, '√($1)');
+  t = t.replace(/\\text\{([^{}]*)\}/g, '$1');
+  t = t.replace(/\\[a-zA-Z]+/g, ' ');
+  t = t.replace(/[{}]/g, '');
+  return t.replace(/\s+/g, ' ').trim();
+}
+
+const fbMathCache = new Map();
+const fbMathPending = new Set();
+
+/* 用 MathJax（与内置公式编辑器同一套渲染）生成高分辨率 SVG 图片 */
+function fbMathImage(latex, color) {
+  const src = fbToLatex(latex);
+  const key = src + '|' + color;
+  if (fbMathCache.has(key)) return fbMathCache.get(key);
+  if (fbMathPending.has(key) || !src || !isMathJaxReady()) return null;
+
+  fbMathPending.add(key);
+  (async function () {
+    try {
+      const node = window.MathJax.tex2svg(src, { display: false });
+      const conv = mathJaxToSvgString(node, color);
+      const k = 640 / Math.max(1, conv.pxW);
+      const W = Math.max(1, Math.round(conv.pxW * k));
+      const H = Math.max(1, Math.round(conv.pxH * k));
+      let svg = conv.svgStr.replace(/<svg([^>]*)>/, function (m, attrs) {
+        attrs = attrs.replace(/\swidth="[^"]*"/ig, '').replace(/\sheight="[^"]*"/ig, '');
+        return '<svg' + attrs + ' width="' + W + '" height="' + H + '">';
+      });
+      const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const img = await new Promise(function (res, rej) {
+        const im = new Image();
+        im.onload = function () { res(im); };
+        im.onerror = function () { rej(new Error('公式 SVG 转图片失败')); };
+        im.src = url;
+      });
+      URL.revokeObjectURL(url);
+      fbMathCache.set(key, { img: img, uW: conv.pxW, uH: conv.pxH, descentEx: conv.descentEx });
+    } catch (e) {
+      fbMathCache.set(key, null);
+    } finally {
+      fbMathPending.delete(key);
+    }
+  })();
+  return null;
+}
+
+function fbHasLetter(formula, ch) {
+  const plain = fbPlain(formula);
+  if (/[A-Za-z]/.test(ch)) return plain.toLowerCase().indexOf(ch.toLowerCase()) >= 0;
+  return plain.indexOf(ch) >= 0;
+}
+function fbLetters(formulas) {
+  const greek = 'αβγθμΔωπρλνεΦΩητ';
+  const set = new Set();
+  formulas.forEach(f => {
+    Array.from(fbPlain(f)).forEach(ch => {
+      if (/[A-Za-z]/.test(ch)) set.add(ch.toUpperCase());
+      else if (greek.indexOf(ch) >= 0) set.add(ch);
+    });
+  });
+  const latin = [], gk = [];
+  set.forEach(ch => {
+    if (/[A-Z]/.test(ch)) latin.push(ch);
+    else gk.push(ch);
+  });
+  latin.sort();
+  gk.sort();
+  return latin.concat(gk);
+}
+
+function openFormulaBallApp() {
+  const el = createWidget('formulaball', '物理公式球',
+    '<circle cx="12" cy="12" r="9"/><path d="M3 9h18M3 15h18"/><path d="M12 3c-3 3-3 15 0 18M12 3c3 3 3 15 0 18"/>');
+  sizeWidget(el, 540, 540);
+  const body = el.querySelector('.widget-body');
+  body.classList.add('no-pad');
+  body.innerHTML =
+    '<div class="mini-canvas fb-wrap">' +
+      '<canvas data-el="cv"></canvas>' +
+      '<div class="fb-top"><span data-el="crumb">字母球</span><span class="fb-count" data-el="count"></span></div>' +
+      '<div class="fb-actions">' +
+        '<button class="mini-btn" data-act="back" style="display:none;">← 字母</button>' +
+        '<button class="mini-btn" data-act="edit">编辑公式</button>' +
+      '</div>' +
+      '<div class="fb-info" data-el="info">拖动旋转 · 点击字母查看包含它的公式</div>' +
+      '<div class="fb-editor" data-el="editor">' +
+        '<textarea data-el="ta" spellcheck="false"></textarea>' +
+        '<div class="fb-editor-hint">每行一条 LaTeX 公式，可直接使用内置公式编辑器的写法，例如 \frac{1}{2} m v^2、\sqrt{2gh}；也兼容旧的纯文本公式。</div>' +
+        '<div class="fb-editor-actions">' +
+          '<button class="mini-btn" data-act="default">恢复默认</button>' +
+          '<button class="mini-btn" data-act="cancel">取消</button>' +
+          '<button class="mini-btn primary" data-act="save">保存</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+
+  const wrap = body.querySelector('.fb-wrap');
+  const cv = body.querySelector('[data-el=cv]');
+  const ctx = cv.getContext('2d');
+  const crumb = body.querySelector('[data-el=crumb]');
+  const countEl = body.querySelector('[data-el=count]');
+  const info = body.querySelector('[data-el=info]');
+  const backBtn = body.querySelector('[data-act=back]');
+  const editor = body.querySelector('[data-el=editor]');
+  const ta = body.querySelector('[data-el=ta]');
+
+  let formulas = fbLoad();
+  let mode = 'letters';
+  let letter = null;
+  let items = [];
+  let pts = [];
+  let yaw = 0.5, pitch = -0.25, vYaw = 0, vPitch = 0;
+  let dragging = false, dragId = null, lastX = 0, lastY = 0, moved = 0;
+  let hover = -1;
+  let raf = 0;
+
+  function buildPoints() {
+    const n = items.length;
+    pts = [];
+    for (let i = 0; i < n; i++) {
+      const y = n === 1 ? 0 : 1 - (i / (n - 1)) * 2;
+      const r = Math.sqrt(Math.max(0, 1 - y * y));
+      const th = i * 2.399963229728653;
+      pts.push({ x: Math.cos(th) * r, y: y, z: Math.sin(th) * r });
+    }
+  }
+
+  function rebuild() {
+    if (mode === 'letters') {
+      const letters = fbLetters(formulas);
+      items = letters.map(ch => ({ text: ch, ch: ch }));
+      crumb.textContent = '字母球';
+      backBtn.style.display = 'none';
+      info.textContent = '拖动旋转 · 点击字母查看包含它的公式';
+    } else {
+      items = formulas.filter(f => fbHasLetter(f, letter)).map(f => ({ text: fbPlain(f), formula: f }));
+      crumb.textContent = '含 “' + letter + '” 的公式';
+      backBtn.style.display = '';
+      info.textContent = '点击公式可复制 · 拖动旋转';
+    }
+    countEl.textContent = items.length + ' 项';
+    buildPoints();
+  }
+
+  function project(w, h) {
+    const cx = w / 2, cy = h / 2;
+    const R = Math.min(w, h) * 0.38;
+    const cyaw = Math.cos(yaw), syaw = Math.sin(yaw);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const out = [];
+    for (let i = 0; i < items.length; i++) {
+      const p = pts[i];
+      const x1 = p.x * cyaw + p.z * syaw;
+      const z1 = -p.x * syaw + p.z * cyaw;
+      const y1 = p.y * cp - z1 * sp;
+      const z2 = p.y * sp + z1 * cp;
+      const persp = 2.4 / (2.4 - z2 * 0.9);
+      out.push({
+        i: i,
+        x: cx + x1 * R * persp,
+        y: cy + y1 * R * persp,
+        z: z2,
+        scale: persp
+      });
+    }
+    out.sort((a, b) => a.z - b.z);
+    return { list: out, cx: cx, cy: cy, R: R };
+  }
+
+  function draw() {
+    const size = fitCanvas(cv, wrap);
+    const w = size.w, h = size.h, dpr = size.dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const bg = ctx.createRadialGradient(w * 0.5, h * 0.45, 10, w * 0.5, h * 0.5, Math.max(w, h) * 0.7);
+    bg.addColorStop(0, 'rgba(14,30,54,.95)');
+    bg.addColorStop(0.7, 'rgba(6,12,24,.98)');
+    bg.addColorStop(1, '#03060d');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, w, h);
+
+    const pr = project(w, h);
+    const isLetters = mode === 'letters';
+
+    for (const p of pr.list) {
+      const it = items[p.i];
+      const depth = (p.z + 1) / 2;
+      const alpha = isLetters ? (0.22 + depth * 0.78) : (0.5 + depth * 0.5);
+      const fscale = Math.max(0.85, Math.min(8, Math.min(w, h) / 430));
+      const base = (isLetters ? 18 : 22) * fscale;
+      const fs = Math.max(9, base * p.scale * (0.8 + depth * 0.35));
+      const hot = p.i === hover;
+
+      if (!isLetters) {
+        const math = fbMathImage(it.formula, hot ? '#ffffff' : '#d8ebfa');
+        if (math) {
+          let dw = math.uW * fs / 16;
+          let dh = math.uH * fs / 16;
+          const maxW = Math.min(w * 0.6, 320);
+          if (dw > maxW) { const k = maxW / dw; dw *= k; dh *= k; }
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          if (hot) {
+            ctx.shadowColor = 'rgba(125,211,252,.95)';
+            ctx.shadowBlur = 18;
+          }
+          ctx.drawImage(math.img, p.x - dw / 2, p.y - dh / 2, dw, dh);
+          ctx.restore();
+          continue;
+        }
+      }
+
+      ctx.font = (isLetters ? '700 ' : '500 ') + fs.toFixed(1) + 'px "Microsoft YaHei","Segoe UI",sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      let label = it.text;
+      if (!isLetters && label.length > 20) label = label.slice(0, 19) + '…';
+      if (hot) {
+        ctx.shadowColor = 'rgba(125,211,252,.95)';
+        ctx.shadowBlur = 16;
+        ctx.fillStyle = 'rgba(255,255,255,1)';
+      } else {
+        ctx.shadowBlur = 0;
+        if (isLetters) {
+          ctx.fillStyle = 'rgba(125,211,252,' + alpha.toFixed(2) + ')';
+        } else {
+          ctx.fillStyle = 'rgba(216,235,250,' + (alpha * 0.95).toFixed(2) + ')';
+        }
+      }
+      ctx.fillText(label, p.x, p.y);
+      ctx.shadowBlur = 0;
+
+      if (isLetters && depth > 0.55) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, fs * 0.95, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(56,189,248,' + ((depth - 0.55) * 0.55).toFixed(2) + ')';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+
+    if (!items.length) {
+      ctx.font = '13px "Microsoft YaHei",sans-serif';
+      ctx.fillStyle = 'rgba(143,163,192,.8)';
+      ctx.textAlign = 'center';
+      ctx.fillText('没有可显示的项', w / 2, h / 2);
+    }
+  }
+
+  function pick(x, y) {
+    const size = fitCanvas(cv, wrap);
+    const pr = project(size.w, size.h);
+    let best = -1, bestD = 1e9;
+    for (const p of pr.list) {
+      const d = Math.hypot(p.x - x, p.y - y);
+      if (d < 22 && d < bestD) { bestD = d; best = p.i; }
+    }
+    return best;
+  }
+
+  function tick() {
+    if (!dragging) {
+      yaw += vYaw + 0.0022;
+      pitch += vPitch;
+      vYaw *= 0.94;
+      vPitch *= 0.94;
+      pitch = Math.max(-1.2, Math.min(1.2, pitch));
+      if (Math.abs(vYaw) < 0.0001) vYaw = 0;
+      if (Math.abs(vPitch) < 0.0001) vPitch = 0;
+    }
+    draw();
+    raf = requestAnimationFrame(tick);
+  }
+
+  cv.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    dragging = true; moved = 0;
+    dragId = e.pointerId;
+    lastX = e.clientX; lastY = e.clientY;
+    try { cv.setPointerCapture(dragId); } catch (err) {}
+  });
+  cv.addEventListener('pointermove', e => {
+    if (!dragging || e.pointerId !== dragId) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    yaw += dx * 0.01;
+    pitch = Math.max(-1.2, Math.min(1.2, pitch + dy * 0.01));
+    vYaw = dx * 0.0018;
+    vPitch = dy * 0.0018;
+    moved += Math.abs(dx) + Math.abs(dy);
+  });
+  const endDrag = e => {
+    if (!dragging || e.pointerId !== dragId) return;
+    dragging = false;
+    dragId = null;
+    if (moved < 6) {
+      const r = cv.getBoundingClientRect();
+      const idx = pick(e.clientX - r.left, e.clientY - r.top);
+      if (idx >= 0) {
+        const it = items[idx];
+        if (mode === 'letters') {
+          const list = formulas.filter(f => fbHasLetter(f, it.ch));
+          if (!list.length) { info.textContent = '没有包含 “' + it.ch + '” 的公式'; return; }
+          letter = it.ch;
+          mode = 'formulas';
+          rebuild();
+        } else {
+          info.textContent = it.text;
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(it.text).then(function () {
+                info.textContent = '已复制：' + it.text;
+              }).catch(function () {});
+            }
+          } catch (err) {}
+        }
+      }
+    }
+  };
+  cv.addEventListener('pointerup', endDrag);
+  cv.addEventListener('pointercancel', endDrag);
+
+  function back() {
+    mode = 'letters'; letter = null; rebuild();
+  }
+  function openEditor() {
+    ta.value = formulas.join('\n');
+    editor.classList.add('show');
+  }
+  function closeEditor() { editor.classList.remove('show'); }
+  function saveEditor() {
+    const list = ta.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    if (!list.length) { toast('至少保留一条公式'); return; }
+    formulas = list;
+    fbSave(formulas);
+    fbMathCache.clear();
+    mode = 'letters'; letter = null;
+    closeEditor();
+    rebuild();
+    toast('已保存 ' + formulas.length + ' 条公式');
+  }
+  function defaultEditor() {
+    ta.value = FB_DEFAULT.join('\n');
+    toast('已载入默认公式，点“保存”生效');
+  }
+
+  wireWidgetActions(el, {
+    back: back,
+    edit: openEditor,
+    cancel: closeEditor,
+    save: saveEditor,
+    default: defaultEditor
+  });
+
+  onWidgetDestroy('formulaball', () => {
+    if (raf) cancelAnimationFrame(raf);
+  });
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(() => draw()).observe(wrap);
+  }
+  el._onResize = () => draw();
+  rebuild();
+  tick();
+}
+
 const MINIAPPS = [
   {
     id: 'clock',
@@ -10801,7 +11737,21 @@ const MINIAPPS = [
     sub: '1~6 颗骰子，带滚动动画',
     icon: '<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/><circle cx="16" cy="16" r="1.4" fill="currentColor"/>',
     open: openDiceApp
-  }
+  },
+  {
+    id: 'spectrum',
+    title: '拾音频谱',
+    sub: '麦克风实时彩色频谱',
+    icon: '<path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 7v10M22 11v2"/>',
+    open: openSpectrumApp
+  },
+  {
+    id: 'formulaball',
+    title: '物理公式球',
+    sub: '字母球 · 点字母查公式 · 可编辑',
+    icon: '<circle cx="12" cy="12" r="9"/><path d="M3 9h18M3 15h18"/><path d="M12 3c-3 3-3 15 0 18M12 3c3 3 3 15 0 18"/>',
+    open: openFormulaBallApp
+  },
 ];
 
 function buildMiniappLauncher() {
@@ -11457,3 +12407,4 @@ window.PhysBoard.getSelection = function () { return selection; };   // ★ 新�
 init();
 
 })();
+
