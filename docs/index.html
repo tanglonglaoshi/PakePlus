@@ -3,10 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*; connect-src *;">
+<meta name="referrer" content="no-referrer">
 <title>唐长老超级物理白板</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-
 <script>
 window.MathJax = {
   tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
@@ -259,7 +258,7 @@ window.MathJax = {
       <div class="visual-frame">
         <div class="visual-glow"></div>
         <div class="visual-inner">
-          <img id="currentImg" class="slide-img" src="" alt="">
+          <img id="currentImg" class="slide-img" src="" alt="" referrerpolicy="no-referrer">
           <div class="visual-scan"></div>
           <div class="visual-shade"></div>
           <div class="visual-caption">
@@ -413,7 +412,7 @@ window.MathJax = {
     const first = (m.slides && m.slides[0] && m.slides[0].img) || '';
     const num = String(idx + 1).padStart(2, '0');
     const cover = first
-      ? '<img src="' + escapeHtml(first) + '" alt="" loading="lazy" onerror="this.style.opacity=0">'
+      ? '<img src="' + escapeHtml(first) + '" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.opacity=0">'
       : '';
     card.innerHTML =
       '<div class="card-cover">' + cover +
@@ -586,7 +585,7 @@ window.MathJax = {
       [slideIdx - 1, slideIdx + 1].forEach(function (k) {
         if (k < 0 || k >= slides.length) return;
         const u = slides[k] && slides[k].img;
-        if (u) { const im = new Image(); im.src = u; }
+        if (u) { const im = new Image(); im.referrerPolicy = 'no-referrer'; im.src = u; }
       });
     }, 240);
   }
